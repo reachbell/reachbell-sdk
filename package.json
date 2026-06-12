@@ -1,0 +1,63 @@
+{
+  "name": "@reachbell/sdk",
+  "version": "1.0.6",
+  "description": "ReachBell official browser SDK — push notifications, email subscriptions, and user identification.",
+  "main": "dist/index.cjs",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs",
+      "default": "./dist/index.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "sideEffects": [
+    "./dist/index.cjs",
+    "./dist/index.mjs"
+  ],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "rollup -c",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm run test && npm run build"
+  },
+  "keywords": [
+    "push notifications",
+    "web push",
+    "reachbell",
+    "transactional",
+    "email",
+    "service worker",
+    "vapid"
+  ],
+  "author": "DotSpheres Technologies Pvt Ltd",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/himanshucsengineer/reachbell-sdk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/himanshucsengineer/reachbell-sdk/issues"
+  },
+  "homepage": "https://reachbell.com",
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@rollup/plugin-typescript": "^11.0.0",
+    "happy-dom": "^20.10.2",
+    "rollup": "^4.0.0",
+    "tslib": "^2.6.0",
+    "typescript": "^5.0.0",
+    "vitest": "^2.0.0"
+  }
+}
