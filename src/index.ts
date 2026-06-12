@@ -131,7 +131,13 @@ const NOTIFICATION_HISTORY = 'reachbell_notif_history';
 const DEFAULT_API_URL = 'https://api.reachbell.com';
 const DEFAULT_SW_PATH = '/reachbell-sw.js';
 const DEFAULT_TIMEOUT_MS = 10_000;
-const DEFAULT_ACCENT = '#6366f1';
+/**
+ * Brand primary — canonical ReachBell blue (`brand-600`). Source of
+ * truth: BRAND.md at the repo root + tailwind config in the marketing
+ * site. Do NOT drift toward Tailwind's default indigo `#6366f1` — that
+ * shifts purple and clashes with the rest of the surfaces.
+ */
+const DEFAULT_ACCENT = '#2563EB';
 const DEFAULT_TITLE  = 'Stay in the loop';
 const DEFAULT_ACCEPT = 'Allow';
 const DEFAULT_DECLINE = 'Not now';

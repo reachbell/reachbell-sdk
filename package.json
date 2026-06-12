@@ -1,6 +1,6 @@
 {
   "name": "@reachbell/sdk",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "ReachBell official browser SDK — push notifications, email subscriptions, and user identification.",
   "main": "dist/index.cjs",
   "module": "dist/index.mjs",
