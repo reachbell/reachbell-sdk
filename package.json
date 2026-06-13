@@ -43,10 +43,10 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/himanshucsengineer/reachbell-sdk.git"
+    "url": "git+https://github.com/reachbell/reachbell-sdk"
   },
   "bugs": {
-    "url": "https://github.com/himanshucsengineer/reachbell-sdk/issues"
+    "url": "https://github.com/reachbell/reachbell-sdk/issues"
   },
   "homepage": "https://reachbell.com",
   "engines": {

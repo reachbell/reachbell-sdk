@@ -16,9 +16,15 @@ import typescript from '@rollup/plugin-typescript';
 export default {
   input: 'src/index.ts',
   output: [
+    // `exports: 'named'` on every format — the source ships named
+    // exports (escapeHtml, safeColor, ReachBell, …) alongside a default
+    // export (also ReachBell). Without this Rollup warns about the
+    // mixed pattern, and CJS consumers reach the default via
+    // `require('@reachbell/sdk').default` — the correct behavior, we
+    // just opt in explicitly.
     { file: 'dist/index.cjs',     format: 'cjs',  sourcemap: true, exports: 'named' },
-    { file: 'dist/index.mjs',     format: 'esm',  sourcemap: true },
-    { file: 'dist/index.iife.js', format: 'iife', sourcemap: true, name: 'ReachBellBundle' },
+    { file: 'dist/index.mjs',     format: 'esm',  sourcemap: true, exports: 'named' },
+    { file: 'dist/index.iife.js', format: 'iife', sourcemap: true, name: 'ReachBellBundle', exports: 'named' },
   ],
   plugins: [
     typescript({
