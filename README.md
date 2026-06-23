@@ -1,6 +1,6 @@
 # @reachbell/sdk
 
-Official ReachBell SDK for web push notifications, email subscriptions, and user identification.
+Official ReachBell SDK for web push notifications, user identification, and in-page widgets (toasts, banners, notification center). One package — no REST calls to write; the dashboard handles sending and campaigns.
 
 ## Install
 
@@ -35,6 +35,11 @@ await ReachBell.tag(['premium', 'active']);
 | `ReachBell.prompt()`          | `Promise<SubscribeResult>`    | Shows the configured opt-in prompt, then subscribes if accepted.             |
 | `ReachBell.identify(extId)`   | `Promise<ApiResult>`          | Links the subscription to your user ID.                                      |
 | `ReachBell.tag(tags)`         | `Promise<ApiResult>`          | Adds tags to the subscription for segmentation.                              |
+| `ReachBell.showToast(opts)`   | `() => void`                  | In-page toast (no push permission needed). Returns a dismiss fn.             |
+| `ReachBell.showBanner(opts)`  | `() => void`                  | Sticky top/bottom announcement bar. Returns a dismiss fn.                    |
+| `ReachBell.showNotificationCenter(opts)` | `() => void`       | Floating bell widget + recent-notifications dropdown.                        |
+| `ReachBell.recordNotification(item)` | `void`                 | Add an item to the local notification-center history.                        |
+| `ReachBell.attachUtmTagger(utm)` | `void`                     | Auto-append UTM params to outbound link clicks for attribution.              |
 | `ReachBell.ready`             | `Promise<void>`               | Resolves once `init()` + bootstrap have settled (success or failure).        |
 
 `ApiResult = { ok: boolean; reason?: string }`. Common reasons: `sdk_not_initialized`, `no_subscription`, `timed_out`, `network_error`, `server_<status>`.
