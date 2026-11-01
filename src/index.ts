@@ -58,14 +58,17 @@ export interface ToastOptions {
   title:       string;
   /** Subtitle / body line. Optional. */
   body?:       string;
+  message?:    string;
   /** Click target — navigates the page when the card body is clicked. */
   url?:        string;
+  actionUrl?:  string;
   /** Auto-dismiss delay in ms. Default 5000. Set 0 to disable auto-dismiss. */
   duration?:   number;
   /** Corner to stack toasts in. Default 'bottom-right'. */
   position?:   ToastPosition;
   /** Accent dot colour. Default ReachBell indigo. Validated by safeColor. */
   accentColor?: string;
+  ctaText?:    string;
 }
 
 export type BannerPosition = 'top' | 'bottom';
@@ -73,10 +76,15 @@ export type BannerPosition = 'top' | 'bottom';
 export interface BannerOptions {
   /** Headline text. Required. */
   title:           string;
+  message?:        string;
+  headline?:       string;
   /** Optional subtitle. */
   body?:           string;
+  highlightText?:  string;
+  secondaryText?:  string;
   /** Click-through URL — banner navigates when clicked. */
   url?:            string;
+  ctaUrl?:         string;
   /** Default 'top'. */
   position?:       BannerPosition;
   /** Auto-dismiss in ms. Default 0 (sticky). */
@@ -89,6 +97,9 @@ export interface BannerOptions {
   dismissible?:    boolean;
   /** Call-to-action button label. Optional — shows next to body when set. */
   ctaText?:        string;
+  ctaButtonColor?: string;
+  ctaButtonTextColor?: string;
+  ctaButtonRadius?: string;
 }
 
 export interface NotificationHistoryItem {
@@ -249,6 +260,55 @@ class ReachBellClient {
       this.serverContext = ctx;
       this.promptConfig  = ctx.promptConfig ?? null;
       await this.registerServiceWorker();
+
+      // 1. Mount In-Page Widgets (Announcement Banner, Notification Center, Corner Toast Alerts)
+      const layouts = ctx.customLayouts ?? {};
+
+      // 1a. Announcement Banner
+      const banner = layouts.banner;
+      if (banner && banner.enabled !== false) {
+        this.showBanner({
+          title: banner.message || banner.title || banner.headline || '🚀 Black Friday Sale — 30% OFF everything this weekend!',
+          body: banner.highlightText || banner.secondaryText || banner.body || '',
+          ctaText: banner.showCta !== false ? (banner.ctaText || 'Shop Now →') : undefined,
+          url: banner.ctaUrl || banner.url,
+          position: banner.position || 'top',
+          backgroundColor: banner.backgroundColor || 'linear-gradient(135deg, #6366f1 0%, #a855f7 100%)',
+          textColor: banner.textColor || '#ffffff',
+          dismissible: banner.dismissible !== false,
+          duration: banner.duration,
+        });
+      }
+
+      // 1b. Notification Center Bell
+      const notifCenter = layouts.notificationCenter;
+      if (notifCenter && notifCenter.enabled !== false) {
+        this.showNotificationCenter({
+          position: notifCenter.position || 'bottom-right',
+          accentColor: notifCenter.accentColor || '#6366f1',
+          title: notifCenter.title || 'Notifications',
+          maxItems: notifCenter.maxItems ?? 20,
+        });
+      }
+
+      // 1c. Corner Toast Alert
+      const toast = layouts.toast;
+      if (toast && toast.enabled !== false) {
+        const delaySec = typeof toast.delaySeconds === 'number' ? toast.delaySeconds : 2;
+        setTimeout(() => {
+          this.showToast({
+            title: toast.title || 'Order Shipped 📦',
+            body: toast.message || toast.body || 'Your package has left the fulfillment warehouse and will arrive tomorrow.',
+            url: toast.actionUrl || toast.url,
+            accentColor: toast.accentColor || '#6366f1',
+            position: toast.position || 'bottom-right',
+            duration: typeof toast.duration === 'number' ? toast.duration * 1000 : 6000,
+            ctaText: toast.showCtaButton !== false ? (toast.ctaText || 'Track Order →') : undefined,
+          });
+        }, Math.max(0, delaySec * 1000));
+      }
+
+      // 2. Opt-in Permission Prompt / Bell Widget
       const isBellWidget = this.promptConfig?.type === 'bell_widget' || (this.promptConfig as any)?.bellWidget?.enabled;
       if (this.promptConfig && this.promptConfig.enabled !== false && isBellWidget) {
         this.mountBellWidget(this.promptConfig);
@@ -441,64 +501,99 @@ class ReachBellClient {
   showToast(opts: ToastOptions): () => void {
     if (typeof document === 'undefined') return () => {};
     const defaults = this.serverContext?.customLayouts?.toast ?? {};
-    const layer = this.ensureToastLayer(opts.position ?? defaults.position ?? 'bottom-right');
+    const pos = opts.position ?? defaults.position ?? 'bottom-right';
+    const layer = this.ensureToastLayer(pos);
     const accent  = safeColor(opts.accentColor ?? defaults.accentColor, DEFAULT_ACCENT);
     const duration = typeof opts.duration === 'number'
       ? Math.max(0, opts.duration)
-      : (typeof defaults.duration === 'number' ? defaults.duration : 5000);
+      : (typeof defaults.duration === 'number' ? defaults.duration : 6000);
+
+    const titleText = opts.title || (opts as any).message || defaults.title || 'Order Shipped 📦';
+    const bodyText = opts.body || (opts as any).message || defaults.message || 'Your package has left the fulfillment warehouse and will arrive tomorrow.';
+    const targetUrl = opts.url || (opts as any).actionUrl || defaults.actionUrl;
+    const ctaText = opts.ctaText || defaults.ctaText;
 
     const card = document.createElement('div');
     Object.assign(card.style, {
       background:   '#0f172a',
       color:        '#f8fafc',
-      borderRadius: '12px',
+      borderRadius: '14px',
       boxShadow:    '0 18px 50px rgba(15,23,42,.35)',
       padding:      '12px 14px',
       width:        '320px',
       maxWidth:     'calc(100vw - 40px)',
-      cursor:       opts.url ? 'pointer' : 'default',
+      cursor:       targetUrl ? 'pointer' : 'default',
       display:      'flex',
-      gap:          '10px',
-      alignItems:   'flex-start',
-      transition:   'opacity 150ms ease, transform 150ms ease',
+      flexDirection:'column',
+      gap:          '8px',
+      transition:   'opacity 200ms ease, transform 200ms ease',
       opacity:      '0',
       transform:    'translateY(8px)',
+      boxSizing:    'border-box',
     });
+
+    const topRow = document.createElement('div');
+    Object.assign(topRow.style, { display: 'flex', gap: '10px', alignItems: 'flex-start', width: '100%' });
+    card.appendChild(topRow);
 
     const dot = document.createElement('div');
     Object.assign(dot.style, {
-      width: '8px', height: '8px', borderRadius: '999px',
-      background: accent, marginTop: '7px', flexShrink: '0',
+      width: '9px', height: '9px', borderRadius: '999px',
+      background: accent, marginTop: '5px', flexShrink: '0',
+      boxShadow: `0 0 8px ${accent}`,
     });
-    card.appendChild(dot);
+    topRow.appendChild(dot);
 
     const text = document.createElement('div');
     Object.assign(text.style, { flex: '1', minWidth: '0' });
 
     const titleEl = document.createElement('div');
-    Object.assign(titleEl.style, { fontSize: '13.5px', fontWeight: '700', lineHeight: '1.25' });
-    titleEl.textContent = opts.title;
+    Object.assign(titleEl.style, { fontSize: '13px', fontWeight: '700', lineHeight: '1.3' });
+    titleEl.textContent = titleText;
     text.appendChild(titleEl);
 
-    if (opts.body) {
+    if (bodyText && bodyText !== titleText) {
       const bodyEl = document.createElement('div');
       Object.assign(bodyEl.style, {
-        fontSize: '12px', color: '#cbd5e1', marginTop: '3px', lineHeight: '1.4',
+        fontSize: '11.5px', color: '#cbd5e1', marginTop: '2px', lineHeight: '1.4',
       });
-      bodyEl.textContent = opts.body;
+      bodyEl.textContent = bodyText;
       text.appendChild(bodyEl);
     }
-    card.appendChild(text);
+
+    if (ctaText) {
+      const ctaBtn = document.createElement('div');
+      Object.assign(ctaBtn.style, {
+        alignSelf: 'flex-start',
+        padding: '3px 10px',
+        borderRadius: '8px',
+        background: accent,
+        color: '#ffffff',
+        fontSize: '10.5px',
+        fontWeight: '700',
+        cursor: 'pointer',
+        marginTop: '6px',
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: '4px',
+        boxShadow: `0 2px 8px ${accent}40`,
+      });
+      ctaBtn.textContent = ctaText;
+      text.appendChild(ctaBtn);
+    }
+    topRow.appendChild(text);
 
     const close = document.createElement('button');
     Object.assign(close.style, {
       border: '0', background: 'transparent', color: '#94a3b8',
-      padding: '0', cursor: 'pointer', fontSize: '14px', lineHeight: '1',
-      marginLeft: '4px', flexShrink: '0',
+      padding: '0 2px', cursor: 'pointer', fontSize: '16px', lineHeight: '1',
+      flexShrink: '0', opacity: '0.6', transition: 'opacity 0.15s',
     });
+    close.onmouseenter = () => { close.style.opacity = '1'; };
+    close.onmouseleave = () => { close.style.opacity = '0.6'; };
     close.setAttribute('aria-label', 'Dismiss');
     close.textContent = '×';
-    card.appendChild(close);
+    topRow.appendChild(close);
 
     let dismissed = false;
     const dismiss = () => {
@@ -510,9 +605,9 @@ class ReachBellClient {
     };
 
     close.addEventListener('click', e => { e.stopPropagation(); dismiss(); });
-    if (opts.url) {
+    if (targetUrl) {
       card.addEventListener('click', () => {
-        try { window.location.href = opts.url!; } catch { /* navigation blocked */ }
+        try { window.location.href = targetUrl; } catch { /* navigation blocked */ }
         dismiss();
       });
     }
@@ -546,9 +641,15 @@ class ReachBellClient {
     });
     // Pin to the appropriate corner.
     if (position.startsWith('top'))    layer.style.top    = '20px';
-    if (position.startsWith('bottom')) layer.style.bottom = '20px';
-    if (position.endsWith('right'))    layer.style.right  = '20px';
-    if (position.endsWith('left'))     layer.style.left   = '20px';
+    if (position === 'bottom-right') {
+      const hasNotifCenter = this.serverContext?.customLayouts?.notificationCenter?.enabled !== false;
+      layer.style.bottom = hasNotifCenter ? '76px' : '20px';
+      layer.style.right  = '20px';
+    } else {
+      if (position.startsWith('bottom')) layer.style.bottom = '20px';
+      if (position.endsWith('right'))    layer.style.right  = '20px';
+      if (position.endsWith('left'))     layer.style.left   = '20px';
+    }
 
     // Children inherit pointer-events: auto so cards remain interactive
     // while the layer itself doesn't block clicks elsewhere on the page.
@@ -623,8 +724,12 @@ class ReachBellClient {
     const dismissible = opts.dismissible !== undefined
       ? opts.dismissible
       : (defaults.dismissible !== undefined ? defaults.dismissible : true);
-    const bg   = safeColor(opts.backgroundColor ?? defaults.backgroundColor, DEFAULT_ACCENT);
-    const text = safeColor(opts.textColor       ?? defaults.textColor,       '#ffffff');
+    const bg   = opts.backgroundColor || defaults.backgroundColor || 'linear-gradient(135deg, #6366f1 0%, #a855f7 100%)';
+    const text = safeColor(opts.textColor ?? defaults.textColor, '#ffffff');
+    const headline = opts.title || opts.message || opts.headline || defaults.message || '🚀 Black Friday Sale — 30% OFF everything this weekend!';
+    const sub = opts.body || opts.highlightText || opts.secondaryText || defaults.highlightText || '';
+    const cta = opts.ctaText || defaults.ctaText || (defaults.showCta !== false ? 'Shop Now →' : undefined);
+    const targetUrl = opts.url || opts.ctaUrl || defaults.ctaUrl;
 
     // Only one banner per position. Replacing dismisses the previous so
     // the page never accumulates a stack of overlapping bars.
@@ -639,11 +744,11 @@ class ReachBellClient {
       [position]:  '0',
       background:  bg,
       color:       text,
-      padding:     '10px 16px',
+      padding:     '10px 18px',
       zIndex:      '2147483645',
       display:     'flex',
       alignItems:  'center',
-      justifyContent: 'center',
+      justifyContent: 'space-between',
       gap:         '14px',
       fontFamily:  'system-ui, -apple-system, Segoe UI, sans-serif',
       fontSize:    '13px',
@@ -651,44 +756,71 @@ class ReachBellClient {
       boxShadow:   position === 'top'
         ? '0 6px 18px rgba(0,0,0,.12)'
         : '0 -6px 18px rgba(0,0,0,.12)',
-      cursor:      opts.url ? 'pointer' : 'default',
+      cursor:      targetUrl && !cta ? 'pointer' : 'default',
       transition:  'transform 200ms ease',
       transform:   position === 'top' ? 'translateY(-100%)' : 'translateY(100%)',
+      boxSizing:   'border-box',
     });
 
     const content = document.createElement('div');
     Object.assign(content.style, {
       display:     'flex',
-      alignItems:  'baseline',
+      alignItems:  'center',
       gap:         '10px',
       flexWrap:    'wrap',
+      flex:        '1',
+      minWidth:    '0',
       justifyContent: 'center',
     });
 
     const titleEl = document.createElement('strong');
     titleEl.style.fontWeight = '700';
-    titleEl.textContent = opts.title;
+    titleEl.textContent = headline;
     content.appendChild(titleEl);
 
-    if (opts.body) {
+    if (sub) {
       const bodyEl = document.createElement('span');
       bodyEl.style.opacity = '0.92';
-      bodyEl.textContent = opts.body;
+      bodyEl.textContent = sub;
       content.appendChild(bodyEl);
     }
-
-    if (opts.ctaText) {
-      const cta = document.createElement('span');
-      Object.assign(cta.style, {
-        marginLeft:    '6px',
-        textDecoration:'underline',
-        fontWeight:    '700',
-        cursor:        'pointer',
-      });
-      cta.textContent = opts.ctaText;
-      content.appendChild(cta);
-    }
     bar.appendChild(content);
+
+    const rightActions = document.createElement('div');
+    Object.assign(rightActions.style, {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '10px',
+      flexShrink: '0',
+    });
+
+    if (cta) {
+      const ctaBtn = document.createElement('button');
+      ctaBtn.type = 'button';
+      Object.assign(ctaBtn.style, {
+        padding:       '5px 14px',
+        borderRadius:  '999px',
+        background:    opts.ctaButtonColor || '#ffffff',
+        color:         opts.ctaButtonTextColor || '#0f172a',
+        fontWeight:    '700',
+        fontSize:      '11px',
+        border:        '0',
+        boxShadow:     '0 1px 3px rgba(0,0,0,0.15)',
+        cursor:        'pointer',
+        display:       'inline-flex',
+        alignItems:    'center',
+        gap:           '4px',
+        flexShrink:    '0',
+      });
+      ctaBtn.textContent = cta;
+      ctaBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (targetUrl) {
+          try { window.location.href = targetUrl; } catch {}
+        }
+      });
+      rightActions.appendChild(ctaBtn);
+    }
 
     let dismissed = false;
     const dismiss = () => {
@@ -702,18 +834,20 @@ class ReachBellClient {
       const close = document.createElement('button');
       Object.assign(close.style, {
         background: 'transparent', border: '0', color: text,
-        opacity: '0.85', cursor: 'pointer', fontSize: '16px',
-        lineHeight: '1', padding: '0 4px', marginLeft: '8px',
+        opacity: '0.85', cursor: 'pointer', fontSize: '18px',
+        lineHeight: '1', padding: '0 4px',
       });
       close.setAttribute('aria-label', 'Dismiss banner');
       close.textContent = '×';
       close.addEventListener('click', e => { e.stopPropagation(); dismiss(); });
-      bar.appendChild(close);
+      rightActions.appendChild(close);
     }
 
-    if (opts.url) {
+    bar.appendChild(rightActions);
+
+    if (targetUrl && !cta) {
       bar.addEventListener('click', () => {
-        try { window.location.href = opts.url!; } catch { /* navigation blocked */ }
+        try { window.location.href = targetUrl; } catch { /* navigation blocked */ }
       });
     }
 
@@ -795,6 +929,17 @@ class ReachBellClient {
     const maxItems = opts.maxItems ?? defaults.maxItems ?? 20;
     const heading  = opts.title ?? defaults.title ?? 'Notifications';
     const emptyTx  = opts.emptyText ?? 'No notifications yet.';
+
+    // Seed initial welcome alert if feed history is fresh
+    if (this.readNotificationHistory().length === 0) {
+      this.recordNotification({
+        id: 'nh_welcome',
+        title: '🎉 Welcome to Notifications',
+        body: 'Special offers, order dispatches, and timely alerts will appear here.',
+        receivedAt: Date.now(),
+        read: false,
+      });
+    }
 
     const id = 'reachbell-notification-center';
     document.getElementById(id)?.remove();
