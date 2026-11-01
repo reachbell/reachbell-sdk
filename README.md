@@ -15,7 +15,6 @@ import { ReachBell } from '@reachbell/sdk';
 
 ReachBell.init({
   apiKey: 'rb_live_yourkey',
-  apiUrl: 'https://api.reachbell.com',
   autoPrompt: true,
 });
 

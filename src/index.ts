@@ -2,7 +2,7 @@
  * ReachBell official SDK.
  *
  *   import { ReachBell } from '@reachbell/sdk';
- *   ReachBell.init({ apiKey: 'rb_live_…', apiUrl: 'https://api.reachbell.com' });
+ *   ReachBell.init({ apiKey: 'rb_live_…' });
  *   await ReachBell.prompt();              // shows the configured opt-in prompt
  *   const r = await ReachBell.identify('user_42');
  *   if (!r.ok) console.warn(r.reason);
@@ -123,6 +123,27 @@ export interface PromptConfig {
   declineText?: string;
   position?: string;
   accentColor?: string;
+  iconUrl?: string;
+  cardBackground?: string;
+  cardTextColor?: string;
+  buttonTextColor?: string;
+  borderRadius?: number;
+  borderWidth?: number;
+  borderColor?: string;
+  boxShadow?: string;
+  allowButtonBackground?: string;
+  allowButtonTextColor?: string;
+  allowButtonBorderRadius?: number;
+  declineButtonBackground?: string;
+  declineButtonTextColor?: string;
+  declineButtonBorderColor?: string;
+  declineButtonBorderRadius?: number;
+  showPoweredBy?: boolean;
+  delay?: number;
+  scrollPercent?: number;
+  bellSize?: 'small' | 'medium' | 'large';
+  bellTooltip?: string;
+  bellPulse?: boolean;
   frequency?: { maxPerSession?: number; cooldownDays?: number };
 }
 
@@ -228,12 +249,19 @@ class ReachBellClient {
       this.serverContext = ctx;
       this.promptConfig  = ctx.promptConfig ?? null;
       await this.registerServiceWorker();
-      if (this.config?.autoPrompt && this.promptConfig?.enabled) {
-        // Chrome ≥80 requires a user gesture for Notification.requestPermission().
-        // Bootstrap runs in a microtask after page load — no gesture in flight —
-        // so we arm a one-shot listener that fires the prompt on first click /
-        // key / tap instead of immediately.
-        this.armAutoPromptOnGesture();
+      const isBellWidget = this.promptConfig?.type === 'bell_widget' || (this.promptConfig as any)?.bellWidget?.enabled;
+      if (this.promptConfig && this.promptConfig.enabled !== false && isBellWidget) {
+        this.mountBellWidget(this.promptConfig);
+      }
+      const shouldAutoPrompt = this.config?.autoPrompt === true || (this.config?.autoPrompt !== false && this.promptConfig?.enabled);
+      if (shouldAutoPrompt && !isBellWidget && this.promptConfig?.enabled) {
+        const delaySec = (this.promptConfig as any)?.delay ?? 1;
+        const delayMs = Math.max(0, delaySec * 1000);
+        setTimeout(() => {
+          if (typeof Notification === 'undefined' || Notification.permission === 'default') {
+            void this.prompt();
+          }
+        }, delayMs);
       }
     } catch (e) {
       this.warnOnce('Bootstrap failed — push notifications will not work on this page', e);
@@ -942,6 +970,165 @@ class ReachBellClient {
     };
   }
 
+  /**
+   * Render an interactive floating bell launcher on the page.
+   * Automatically mounted during bootstrap if configured in the dashboard.
+   */
+  showBellWidget(options?: any): () => void {
+    const cfg = options ?? this.promptConfig ?? {};
+    return this.mountBellWidget(cfg);
+  }
+
+  private mountBellWidget(cfg: any): () => void {
+    if (typeof document === 'undefined') return () => {};
+    const id = 'reachbell-bell-widget';
+    document.getElementById(id)?.remove();
+
+    const position = cfg.position || cfg.bellWidget?.position || 'bottom-right';
+    const accent = safeColor(cfg.accentColor || cfg.bellWidget?.color, DEFAULT_ACCENT);
+    const sizeStr = cfg.bellSize || cfg.bellWidget?.size || 'medium';
+    const sizePx = sizeStr === 'small' ? 40 : sizeStr === 'large' ? 56 : 48;
+    const tooltipText = cfg.bellTooltip || cfg.bellWidget?.tooltipText || 'Enable notifications';
+    const pulse = cfg.bellPulse !== false && cfg.bellWidget?.pulseAnimation !== false;
+
+    if (!document.getElementById('reachbell-bell-styles')) {
+      const style = document.createElement('style');
+      style.id = 'reachbell-bell-styles';
+      style.textContent = `
+        @keyframes rb-bell-ping {
+          0% { transform: scale(1); opacity: 0.6; }
+          75%, 100% { transform: scale(1.6); opacity: 0; }
+        }
+        .rb-bell-pulse {
+          position: absolute; inset: 0; border-radius: 9999px;
+          animation: rb-bell-ping 2s cubic-bezier(0, 0, 0.2, 1) infinite;
+          pointer-events: none;
+        }
+        .rb-bell-btn:hover .rb-bell-tooltip {
+          opacity: 1 !important;
+          transform: translateY(0) !important;
+          pointer-events: auto !important;
+        }
+      `;
+      document.head.appendChild(style);
+    }
+
+    const container = document.createElement('div');
+    container.id = id;
+    container.className = 'rb-bell-btn';
+    Object.assign(container.style, {
+      position: 'fixed',
+      zIndex: '2147483640',
+      display: 'flex',
+      flexDirection: 'column',
+      alignItems: position.endsWith('left') ? 'flex-start' : 'flex-end',
+      fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
+      transition: 'transform 0.2s ease',
+    });
+
+    if (position.startsWith('top'))    container.style.top    = '20px';
+    if (position.startsWith('bottom')) container.style.bottom = '20px';
+    if (position.endsWith('right'))    container.style.right  = '20px';
+    if (position.endsWith('left'))     container.style.left   = '20px';
+
+    if (tooltipText) {
+      const tooltip = document.createElement('div');
+      tooltip.className = 'rb-bell-tooltip';
+      Object.assign(tooltip.style, {
+        padding: '6px 12px',
+        borderRadius: '8px',
+        background: '#0f172a',
+        color: '#ffffff',
+        fontSize: '11px',
+        fontWeight: '600',
+        boxShadow: '0 10px 25px -5px rgba(0,0,0,0.3)',
+        whiteSpace: 'nowrap',
+        marginBottom: '8px',
+        opacity: '0',
+        transform: 'translateY(4px)',
+        transition: 'opacity 0.2s ease, transform 0.2s ease',
+        pointerEvents: 'none',
+      });
+      tooltip.textContent = tooltipText;
+      container.appendChild(tooltip);
+    }
+
+    const btnWrap = document.createElement('div');
+    Object.assign(btnWrap.style, {
+      position: 'relative',
+      width: `${sizePx}px`,
+      height: `${sizePx}px`,
+    });
+
+    if (pulse) {
+      const pulseRing = document.createElement('div');
+      pulseRing.className = 'rb-bell-pulse';
+      pulseRing.style.background = accent;
+      btnWrap.appendChild(pulseRing);
+    }
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.setAttribute('aria-label', tooltipText);
+    Object.assign(button.style, {
+      width: `${sizePx}px`,
+      height: `${sizePx}px`,
+      borderRadius: '9999px',
+      background: accent,
+      color: '#ffffff',
+      border: 'none',
+      cursor: 'pointer',
+      boxShadow: '0 10px 25px -3px rgba(0,0,0,0.25)',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      position: 'relative',
+      zIndex: '1',
+      transition: 'transform 0.15s ease, box-shadow 0.15s ease',
+      outline: 'none',
+      padding: '0',
+    });
+
+    const iconSize = Math.round(sizePx * 0.45);
+    button.innerHTML = `<svg width="${iconSize}" height="${iconSize}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>`;
+
+    button.addEventListener('mouseenter', () => {
+      button.style.transform = 'scale(1.08)';
+    });
+    button.addEventListener('mouseleave', () => {
+      button.style.transform = 'scale(1)';
+    });
+
+    button.addEventListener('click', async () => {
+      if (typeof Notification !== 'undefined') {
+        if (Notification.permission === 'granted') {
+          this.showToast({
+            title: 'Notifications Active',
+            body: 'You are subscribed to receive updates from this site.',
+            duration: 3500,
+            accentColor: accent,
+          });
+          return;
+        } else if (Notification.permission === 'denied') {
+          this.showToast({
+            title: 'Notifications Blocked',
+            body: 'Notifications are blocked in your browser settings. Click the site settings icon to allow.',
+            duration: 5000,
+            accentColor: '#ef4444',
+          });
+          return;
+        }
+      }
+      await this.prompt();
+    });
+
+    btnWrap.appendChild(button);
+    container.appendChild(btnWrap);
+    document.body.appendChild(container);
+
+    return () => container.remove();
+  }
+
   private markRead(id: string): void {
     if (typeof localStorage === 'undefined') return;
     try {
@@ -983,96 +1170,291 @@ class ReachBellClient {
    */
   private async showCustomPrompt(cfg: PromptConfig): Promise<boolean> {
     return new Promise(resolve => {
+      // Clean up any existing prompt before showing a new one
+      document.getElementById('reachbell-custom-prompt')?.remove();
+
       const accent = safeColor(cfg.accentColor, DEFAULT_ACCENT);
+      const rawPos = cfg.position || (cfg as any).softPrompt?.position || 'bottom-center';
+      const pos = rawPos.toLowerCase().replace(/_/g, '-');
+      const isCenterModal = pos === 'center-modal';
+      const isTopBar = pos === 'top-bar' || pos === 'banner';
+
+      const allowBg = safeColor(cfg.allowButtonBackground || cfg.accentColor, accent);
+      const allowColor = safeColor(cfg.allowButtonTextColor || cfg.buttonTextColor, '#ffffff');
+      const allowRadius = cfg.allowButtonBorderRadius ?? 10;
+
+      const declineBg = safeColor(cfg.declineButtonBackground, '#f8fafc');
+      const declineColor = safeColor(cfg.declineButtonTextColor, '#475569');
+      const declineBorder = safeColor(cfg.declineButtonBorderColor, '#e2e8f0');
+      const declineRadius = cfg.declineButtonBorderRadius ?? 10;
+
+      const cardBg = safeColor(cfg.cardBackground, '#ffffff');
+      const cardText = safeColor(cfg.cardTextColor, '#0f172a');
+      const cardBorder = safeColor(cfg.borderColor, '#e2e8f0');
+      const cardBorderWidth = typeof cfg.borderWidth === 'number' ? cfg.borderWidth : 1;
+      const cardRadius = isTopBar ? 0 : (typeof cfg.borderRadius === 'number' ? cfg.borderRadius : 16);
+
+      const shadowMap: Record<string, string> = {
+        none: 'none',
+        sm:   '0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px -1px rgba(0, 0, 0, 0.1)',
+        md:   '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1)',
+        xl:   '0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1)',
+        '2xl': '0 25px 50px -12px rgba(0, 0, 0, 0.25)',
+        glow: `0 12px 36px -4px ${(cfg.accentColor && cfg.accentColor.startsWith('#') && cfg.accentColor.length === 7) ? `${cfg.accentColor}45` : 'rgba(99, 102, 241, 0.35)'}`,
+      };
+      const cardShadow = shadowMap[cfg.boxShadow || ''] || '0 20px 45px -10px rgba(15,23,42,.22), 0 0 0 1px rgba(0,0,0,0.06)';
 
       const root = document.createElement('div');
+      root.id = 'reachbell-custom-prompt';
       Object.assign(root.style, {
         position: 'fixed',
         zIndex:   '2147483647',
-        fontFamily: 'system-ui,-apple-system,sans-serif',
+        fontFamily: 'system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif',
       });
-      const pos = cfg.position ?? 'bottom-center';
-      if (pos.startsWith('bottom')) root.style.bottom = '20px';
-      if (pos.startsWith('top'))    root.style.top    = '20px';
-      if (pos.endsWith('center'))   { root.style.left = '50%'; root.style.transform = 'translateX(-50%)'; }
-      if (pos.endsWith('left'))     root.style.left  = '20px';
-      if (pos.endsWith('right'))    root.style.right = '20px';
 
-      const card = document.createElement('div');
-      Object.assign(card.style, {
-        background:   '#fff',
-        borderRadius: '14px',
-        boxShadow:    '0 18px 50px rgba(15,23,42,.16)',
-        padding:      '18px',
-        width:        '320px',
-        maxWidth:     'calc(100vw - 40px)',
-      });
-      root.appendChild(card);
+      if (isCenterModal) {
+        Object.assign(root.style, {
+          inset: '0',
+          width: '100vw',
+          height: '100vh',
+          background: 'rgba(15, 23, 42, 0.48)',
+          backdropFilter: 'blur(4px)',
+          WebkitBackdropFilter: 'blur(4px)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: '16px',
+          boxSizing: 'border-box',
+          pointerEvents: 'auto',
+        });
+      } else if (isTopBar) {
+        Object.assign(root.style, {
+          top: '0',
+          left: '0',
+          right: '0',
+          width: '100%',
+          pointerEvents: 'auto',
+        });
+      } else {
+        Object.assign(root.style, {
+          pointerEvents: 'none',
+        });
+        if (pos.startsWith('bottom')) root.style.bottom = '24px';
+        if (pos.startsWith('top'))    root.style.top    = '24px';
+        if (pos.includes('center'))   { root.style.left = '50%'; root.style.transform = 'translateX(-50%)'; }
+        if (pos.endsWith('left'))     root.style.left  = '24px';
+        if (pos.endsWith('right'))    root.style.right = '24px';
+      }
 
-      const row = document.createElement('div');
-      Object.assign(row.style, { display: 'flex', gap: '12px', alignItems: 'flex-start' });
-      card.appendChild(row);
+      if (isTopBar) {
+        const banner = document.createElement('div');
+        Object.assign(banner.style, {
+          width: '100%',
+          background: cardBg,
+          color: cardText,
+          borderBottom: `${cardBorderWidth}px solid ${cardBorder}`,
+          boxShadow: '0 4px 12px rgba(0,0,0,0.08)',
+          padding: '12px 20px',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: '16px',
+          boxSizing: 'border-box',
+        });
 
-      const iconBox = document.createElement('div');
-      Object.assign(iconBox.style, {
-        width: '38px', height: '38px', borderRadius: '10px',
-        background: accent,
-        display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: '0',
-      });
-      // SVG carries no style attributes, so innerHTML here is CSP-safe.
-      iconBox.innerHTML =
-        '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5">' +
-        '<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/>' +
-        '<path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>' +
-        '</svg>';
-      row.appendChild(iconBox);
+        const leftCol = document.createElement('div');
+        Object.assign(leftCol.style, {
+          display: 'flex',
+          alignItems: 'center',
+          gap: '12px',
+          flex: '1',
+          minWidth: '0',
+        });
 
-      const textCol = document.createElement('div');
-      Object.assign(textCol.style, { flex: '1', minWidth: '0' });
-      row.appendChild(textCol);
+        if (cfg.iconUrl) {
+          const img = document.createElement('img');
+          img.src = cfg.iconUrl;
+          img.alt = 'Logo';
+          Object.assign(img.style, {
+            width: '32px', height: '32px', borderRadius: '8px', objectFit: 'contain',
+            flexShrink: '0', border: '1px solid rgba(226,232,240,0.6)', background: '#fff', padding: '2px', boxSizing: 'border-box',
+          });
+          leftCol.appendChild(img);
+        } else {
+          const icon = document.createElement('div');
+          Object.assign(icon.style, {
+            width: '32px', height: '32px', borderRadius: '8px', background: allowBg,
+            display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: '0', color: allowColor,
+          });
+          icon.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>';
+          leftCol.appendChild(icon);
+        }
 
-      const titleEl = document.createElement('div');
-      Object.assign(titleEl.style, {
-        fontWeight: '800', color: '#0f172a', fontSize: '14px', lineHeight: '1.3',
-      });
-      titleEl.textContent = cfg.title ?? DEFAULT_TITLE;
-      textCol.appendChild(titleEl);
+        const bannerText = document.createElement('div');
+        Object.assign(bannerText.style, { fontSize: '13px', lineHeight: '1.4', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' });
+        bannerText.innerHTML = `<strong>${escapeHtml(cfg.title || DEFAULT_TITLE)}</strong>: <span style="opacity: 0.85;">${escapeHtml(cfg.body || '')}</span>`;
+        leftCol.appendChild(bannerText);
+        banner.appendChild(leftCol);
 
-      const bodyEl = document.createElement('div');
-      Object.assign(bodyEl.style, {
-        color: '#64748b', fontSize: '12px', lineHeight: '1.5', marginTop: '4px',
-      });
-      bodyEl.textContent = cfg.body ?? '';
-      textCol.appendChild(bodyEl);
+        const rightCol = document.createElement('div');
+        Object.assign(rightCol.style, { display: 'flex', alignItems: 'center', gap: '8px', flexShrink: '0' });
 
-      const buttons = document.createElement('div');
-      Object.assign(buttons.style, { display: 'flex', gap: '8px', marginTop: '14px' });
-      card.appendChild(buttons);
+        const allowBtn = document.createElement('button');
+        allowBtn.dataset.action = 'accept';
+        Object.assign(allowBtn.style, {
+          border: '0', padding: '7px 16px', borderRadius: `${allowRadius}px`,
+          background: allowBg, color: allowColor, fontWeight: '700', fontSize: '12.5px', cursor: 'pointer',
+        });
+        allowBtn.textContent = cfg.acceptText || DEFAULT_ACCEPT;
+        rightCol.appendChild(allowBtn);
 
-      const acceptBtn = document.createElement('button');
-      acceptBtn.dataset.action = 'accept';
-      Object.assign(acceptBtn.style, {
-        flex: '1', border: '0', padding: '9px 12px', borderRadius: '10px',
-        background: accent, color: '#fff', fontWeight: '700', fontSize: '13px', cursor: 'pointer',
-      });
-      acceptBtn.textContent = cfg.acceptText ?? DEFAULT_ACCEPT;
-      buttons.appendChild(acceptBtn);
+        const dismissBtn = document.createElement('button');
+        dismissBtn.dataset.action = 'decline';
+        Object.assign(dismissBtn.style, {
+          border: `1px solid ${declineBorder}`, padding: '7px 14px', borderRadius: `${declineRadius}px`,
+          background: declineBg, color: declineColor, fontWeight: '600', fontSize: '12.5px', cursor: 'pointer',
+        });
+        dismissBtn.textContent = cfg.declineText || DEFAULT_DECLINE;
+        rightCol.appendChild(dismissBtn);
 
-      const declineBtn = document.createElement('button');
-      declineBtn.dataset.action = 'decline';
-      Object.assign(declineBtn.style, {
-        flex: '1', border: '0', padding: '9px 12px', borderRadius: '10px',
-        background: '#f1f5f9', color: '#475569', fontWeight: '700', fontSize: '13px', cursor: 'pointer',
-      });
-      declineBtn.textContent = cfg.declineText ?? DEFAULT_DECLINE;
-      buttons.appendChild(declineBtn);
+        banner.appendChild(rightCol);
+        root.appendChild(banner);
+      } else {
+        const card = document.createElement('div');
+        Object.assign(card.style, {
+          background:   cardBg,
+          color:        cardText,
+          borderRadius: `${cardRadius}px`,
+          border:       cardBorderWidth > 0 ? `${cardBorderWidth}px solid ${cardBorder}` : 'none',
+          boxShadow:    cardShadow,
+          padding:      '18px',
+          width:        '340px',
+          maxWidth:     'calc(100vw - 32px)',
+          position:     'relative',
+          boxSizing:    'border-box',
+          pointerEvents: 'auto',
+        });
+        root.appendChild(card);
+
+        const row = document.createElement('div');
+        Object.assign(row.style, { display: 'flex', gap: '12px', alignItems: 'flex-start' });
+        card.appendChild(row);
+
+        if (cfg.iconUrl) {
+          const img = document.createElement('img');
+          img.src = cfg.iconUrl;
+          img.alt = 'Brand Logo';
+          Object.assign(img.style, {
+            width: '40px',
+            height: '40px',
+            borderRadius: '12px',
+            objectFit: 'contain',
+            flexShrink: '0',
+            border: '1px solid rgba(226, 232, 240, 0.6)',
+            background: '#ffffff',
+            padding: '2px',
+            boxSizing: 'border-box',
+          });
+          row.appendChild(img);
+        } else {
+          const iconBox = document.createElement('div');
+          Object.assign(iconBox.style, {
+            width: '40px', height: '40px', borderRadius: '12px',
+            background: allowBg,
+            display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: '0',
+            color: allowColor,
+          });
+          iconBox.innerHTML =
+            '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3">' +
+            '<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/>' +
+            '<path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>' +
+            '</svg>';
+          row.appendChild(iconBox);
+        }
+
+        const textCol = document.createElement('div');
+        Object.assign(textCol.style, { flex: '1', minWidth: '0' });
+        row.appendChild(textCol);
+
+        const titleEl = document.createElement('div');
+        Object.assign(titleEl.style, {
+          fontWeight: '800', color: cardText, fontSize: '14.5px', lineHeight: '1.3',
+        });
+        titleEl.textContent = cfg.title ?? DEFAULT_TITLE;
+        textCol.appendChild(titleEl);
+
+        const bodyEl = document.createElement('div');
+        Object.assign(bodyEl.style, {
+          color: cardText, opacity: '0.8', fontSize: '12px', lineHeight: '1.5', marginTop: '4px',
+        });
+        bodyEl.textContent = cfg.body ?? '';
+        textCol.appendChild(bodyEl);
+
+        // Close 'x' button in header
+        const closeBtn = document.createElement('button');
+        closeBtn.dataset.action = 'decline';
+        closeBtn.setAttribute('aria-label', 'Close');
+        Object.assign(closeBtn.style, {
+          background: 'transparent',
+          border: '0',
+          color: cardText,
+          opacity: '0.45',
+          fontSize: '16px',
+          cursor: 'pointer',
+          padding: '0 4px',
+          lineHeight: '1',
+          transition: 'opacity 0.15s ease',
+        });
+        closeBtn.onmouseenter = () => { closeBtn.style.opacity = '0.9'; };
+        closeBtn.onmouseleave = () => { closeBtn.style.opacity = '0.45'; };
+        closeBtn.innerHTML = '✕';
+        row.appendChild(closeBtn);
+
+        const buttons = document.createElement('div');
+        Object.assign(buttons.style, { display: 'flex', gap: '8px', marginTop: '14px' });
+        card.appendChild(buttons);
+
+        const acceptBtn = document.createElement('button');
+        acceptBtn.dataset.action = 'accept';
+        Object.assign(acceptBtn.style, {
+          flex: '1', border: '0', padding: '9px 14px', borderRadius: `${allowRadius}px`,
+          background: allowBg, color: allowColor, fontWeight: '700', fontSize: '13px', cursor: 'pointer',
+          boxShadow: '0 4px 12px ' + allowBg + '40',
+        });
+        acceptBtn.textContent = cfg.acceptText ?? DEFAULT_ACCEPT;
+        buttons.appendChild(acceptBtn);
+
+        const declineBtn = document.createElement('button');
+        declineBtn.dataset.action = 'decline';
+        Object.assign(declineBtn.style, {
+          flex: '1', border: `1px solid ${declineBorder}`, padding: '9px 14px', borderRadius: `${declineRadius}px`,
+          background: declineBg, color: declineColor, fontWeight: '700', fontSize: '13px', cursor: 'pointer',
+        });
+        declineBtn.textContent = cfg.declineText ?? DEFAULT_DECLINE;
+        buttons.appendChild(declineBtn);
+
+        if ((cfg as any).showPoweredBy !== false) {
+          const poweredBy = document.createElement('div');
+          Object.assign(poweredBy.style, {
+            marginTop: '10px', paddingTop: '8px', borderTop: '1px solid rgba(148, 163, 184, 0.15)',
+            fontSize: '10.5px', textAlign: 'center', color: cardText, opacity: '0.6',
+          });
+          poweredBy.innerHTML = 'Powered by <strong style="color: #2563EB;">ReachBell</strong>';
+          card.appendChild(poweredBy);
+        }
+      }
 
       document.body.appendChild(root);
       root.addEventListener('click', e => {
-        const action = (e.target as HTMLElement).closest('button')?.dataset.action;
-        if (action !== 'accept' && action !== 'decline') return;
-        root.remove();
-        resolve(action === 'accept');
+        const target = e.target as HTMLElement;
+        const action = target.closest('button')?.dataset.action;
+        if (action === 'accept' || action === 'decline') {
+          root.remove();
+          resolve(action === 'accept');
+        } else if (isCenterModal && target === root) {
+          root.remove();
+          resolve(false);
+        }
       });
     });
   }

@@ -18,8 +18,12 @@
     "./dist/index.cjs",
     "./dist/index.mjs"
   ],
+  "bin": {
+    "reachbell": "./bin/reachbell.js"
+  },
   "files": [
     "dist",
+    "bin",
     "README.md",
     "LICENSE"
   ],
