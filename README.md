@@ -59,7 +59,7 @@ The service worker must be served from your site's root (`/reachbell-sw.js`). Cr
 npx reachbell
 ```
 
-This writes `reachbell-sw.js` into `public/` (or the current folder), loading the latest worker from ReachBell. Pass `swPath` to `init()` if you serve it somewhere else. The SDK sends the worker your `apiUrl`, so delivery and click analytics reach the ReachBell API.
+This writes `reachbell-sw.js` into `public/` (or the current folder), loading the latest worker from ReachBell. Pass `swPath` to `init()` if you serve it somewhere else. The SDK tells the worker which API to report delivery and clicks to. That is https://api.reachbell.com unless you pass `apiUrl`, which you only need for a staging or self-hosted API.
 
 Script-tag builds can load `@reachbell/sdk/iife` (`dist/index.iife.js`), which sets `window.ReachBell`.
 
