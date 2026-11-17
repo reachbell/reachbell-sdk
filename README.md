@@ -18,12 +18,15 @@ ReachBell.init({
   autoPrompt: true,
 });
 
-// After login, link the subscription to your user ID:
-const r = await ReachBell.identify('user_42');
-if (!r.ok) console.warn('identify failed:', r.reason);
+await ReachBell.ready;
 
-// Apply tags for segmentation:
-await ReachBell.tag(['premium', 'active']);
+// identify() and tag() need a subscription, so call them after prompt()
+// succeeds, or on later page loads for visitors who already subscribed:
+const sub = await ReachBell.prompt();
+if (sub.success) {
+  await ReachBell.identify('user_42');
+  await ReachBell.tag(['premium', 'active']);
+}
 ```
 
 ## API surface
@@ -31,7 +34,8 @@ await ReachBell.tag(['premium', 'active']);
 | Method                        | Returns                       | Notes                                                                        |
 | ----------------------------- | ----------------------------- | ---------------------------------------------------------------------------- |
 | `ReachBell.init(config)`      | `void`                        | Idempotent — second call is a no-op unless `force:true` is set.              |
-| `ReachBell.prompt()`          | `Promise<SubscribeResult>`    | Shows the configured opt-in prompt, then subscribes if accepted.             |
+| `ReachBell.prompt()`          | `Promise<SubscribeResult>`    | Shows the configured opt-in prompt, then subscribes if accepted. Returns `permission_denied` straight away when the browser has blocked notifications, and re-uses an existing subscription when permission is already granted. |
+| `ReachBell.unsubscribe()`     | `Promise<ApiResult>`          | Removes this browser's push subscription and forgets the stored token.       |
 | `ReachBell.identify(extId)`   | `Promise<ApiResult>`          | Links the subscription to your user ID.                                      |
 | `ReachBell.tag(tags)`         | `Promise<ApiResult>`          | Adds tags to the subscription for segmentation.                              |
 | `ReachBell.showToast(opts)`   | `() => void`                  | In-page toast (no push permission needed). Returns a dismiss fn.             |
@@ -39,13 +43,25 @@ await ReachBell.tag(['premium', 'active']);
 | `ReachBell.showNotificationCenter(opts)` | `() => void`       | Floating bell widget + recent-notifications dropdown.                        |
 | `ReachBell.recordNotification(item)` | `void`                 | Add an item to the local notification-center history.                        |
 | `ReachBell.attachUtmTagger(utm)` | `void`                     | Auto-append UTM params to outbound link clicks for attribution.              |
-| `ReachBell.ready`             | `Promise<void>`               | Resolves once `init()` + bootstrap have settled (success or failure).        |
+| `ReachBell.ready`             | `Promise<void>`               | Resolves once `init()` + bootstrap have settled (success or failure). Returning subscribers are re-synced before it resolves. |
+
+With `autoPrompt: true` the SDK shows the dashboard prompt on its own, using the dashboard's delay, scroll depth and frequency settings. A `native` prompt waits for the visitor's first click or key press, because browsers ignore permission requests that are not triggered by the visitor. Banner, toast and notification-center widgets appear only when they are switched on in the dashboard.
+
+`SubscribeResult` reasons: `sdk_not_initialized`, `push_not_supported`, `not_ready`, `permission_denied`, `user_declined_soft_prompt`, `sw_not_active`, `sw_register_failed_<name>`, `push_subscribe_failed_<name>`, `subscribe_failed_<status>`, `timed_out`, `network_error`.
 
 `ApiResult = { ok: boolean; reason?: string }`. Common reasons: `sdk_not_initialized`, `no_subscription`, `timed_out`, `network_error`, `server_<status>`.
 
 ## Service Worker
 
-Copy `reachbell-sw.js` from your ReachBell dashboard into your site's root directory.
+The service worker must be served from your site's root (`/reachbell-sw.js`). Create it with:
+
+```bash
+npx reachbell
+```
+
+This writes `reachbell-sw.js` into `public/` (or the current folder), loading the latest worker from ReachBell. Pass `swPath` to `init()` if you serve it somewhere else. The SDK sends the worker your `apiUrl`, so delivery and click analytics reach the ReachBell API.
+
+Script-tag builds can load `@reachbell/sdk/iife` (`dist/index.iife.js`), which sets `window.ReachBell`.
 
 ## Documentation
 

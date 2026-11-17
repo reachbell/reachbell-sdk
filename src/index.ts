@@ -156,9 +156,57 @@ export interface PromptConfig {
   bellTooltip?: string;
   bellPulse?: boolean;
   frequency?: { maxPerSession?: number; cooldownDays?: number };
+  frequencyCap?: { maxShows?: number; periodDays?: number };
+  overlayEnabled?: boolean;
+  overlayColor?: string;
+  softPrompt?: { position?: string; overlayEnabled?: boolean; overlayColor?: string };
+}
+
+export type PromptPlacement =
+  | 'center-modal'
+  | 'top-bar'
+  | 'top-left'
+  | 'top-center'
+  | 'top-right'
+  | 'bottom-left'
+  | 'bottom-center'
+  | 'bottom-right';
+
+const PROMPT_PLACEMENTS: readonly PromptPlacement[] = [
+  'center-modal', 'top-bar', 'top-left', 'top-center', 'top-right', 'bottom-left', 'bottom-center', 'bottom-right',
+];
+
+const PROMPT_ALIASES: Record<string, PromptPlacement> = {
+  center: 'center-modal',
+  centre: 'center-modal',
+  middle: 'center-modal',
+  modal: 'center-modal',
+  'centre-modal': 'center-modal',
+  'center-center': 'center-modal',
+  banner: 'top-bar',
+  top: 'top-center',
+  bottom: 'bottom-center',
+  left: 'bottom-left',
+  right: 'bottom-right',
+};
+
+export function resolvePromptPlacement(raw: unknown): PromptPlacement {
+  if (typeof raw !== 'string') return 'bottom-center';
+  const key = raw.trim().toLowerCase().replace(/[\s_]+/g, '-');
+  if ((PROMPT_PLACEMENTS as readonly string[]).includes(key)) return key as PromptPlacement;
+  return PROMPT_ALIASES[key] ?? 'bottom-center';
+}
+
+export function promptCapAllows(shownAt: number[], now: number, cap?: { maxShows?: number; periodDays?: number }): boolean {
+  const maxShows = cap?.maxShows;
+  if (typeof maxShows !== 'number' || maxShows <= 0) return true;
+  const periodMs = Math.max(0, cap?.periodDays ?? 0) * 86_400_000;
+  const recent = periodMs > 0 ? shownAt.filter(time => now - time < periodMs) : shownAt;
+  return recent.length < maxShows;
 }
 
 const TOKEN_KEY            = 'reachbell_token';
+const PROMPT_SHOWS_KEY     = 'reachbell_prompt_shows';
 const NOTIFICATION_HISTORY = 'reachbell_notif_history';
 const DEFAULT_API_URL = 'https://api.reachbell.com';
 const DEFAULT_SW_PATH = '/reachbell-sw.js';
@@ -215,6 +263,75 @@ export function urlBase64ToUint8Array(base64: string): Uint8Array<ArrayBuffer> {
   return arr;
 }
 
+const DAY_MS = 86_400_000;
+const SESSION_SHOWS_KEY = 'reachbell_prompt_session_shows';
+const ENDPOINT_KEY = 'reachbell_endpoint';
+const SW_ACTIVATE_TIMEOUT_MS = 10_000;
+
+export interface PromptHistory {
+  sessionShows: number;
+  lastShownAt:  number | null;
+  shownAt:      number[];
+}
+
+export function promptFrequencyAllows(
+  history: PromptHistory,
+  now: number,
+  cfg?: Pick<PromptConfig, 'frequency' | 'frequencyCap'> | null,
+): boolean {
+  const frequency = cfg?.frequency;
+  if (frequency && typeof frequency === 'object') {
+    const max = frequency.maxPerSession;
+    if (typeof max === 'number' && max > 0 && history.sessionShows >= max) return false;
+    const cooldownMs = Math.max(0, frequency.cooldownDays ?? 0) * DAY_MS;
+    if (history.sessionShows === 0 && cooldownMs > 0 && history.lastShownAt !== null && now - history.lastShownAt < cooldownMs) {
+      return false;
+    }
+    return true;
+  }
+  return promptCapAllows(history.shownAt, now, cfg?.frequencyCap);
+}
+
+export function widgetEnabled(layout: unknown): layout is Record<string, any> {
+  return !!layout && typeof layout === 'object' && (layout as { enabled?: unknown }).enabled === true;
+}
+
+export function safeUrl(raw: unknown): string | null {
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  try {
+    const base = typeof window !== 'undefined' ? window.location.href : 'https://localhost/';
+    const url = new URL(raw.trim(), base);
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+export function safeBackground(input: unknown, fallback: string): string {
+  if (typeof input !== 'string') return fallback;
+  if (safeColor(input, '') === input) return input;
+  if (/^(?:linear|radial)-gradient\([#\w\s.,%()-]+\)$/i.test(input) && !/url\s*\(/i.test(input)) return input;
+  return fallback;
+}
+
+export function normalizeApiUrl(raw: string): string {
+  return raw.trim().replace(/\/+$/, '');
+}
+
+export function scrollProgress(scrollTop: number, scrollHeight: number, viewportHeight: number): number {
+  const max = scrollHeight - viewportHeight;
+  if (max <= 0) return 100;
+  return Math.min(100, Math.max(0, (scrollTop / max) * 100));
+}
+
+export function sameApplicationServerKey(current: ArrayBuffer | null | undefined, publicKey: string): boolean {
+  if (!current) return true;
+  const expected = urlBase64ToUint8Array(publicKey);
+  const actual = new Uint8Array(current);
+  if (actual.length !== expected.length) return false;
+  return actual.every((byte, index) => byte === expected[index]);
+}
+
 /* ─── Client ──────────────────────────────────────────────────── */
 
 class ReachBellClient {
@@ -223,13 +340,11 @@ class ReachBellClient {
   private serverContext: any = null;
   private swReg: ServiceWorkerRegistration | null = null;
   private bootstrapping: Promise<void> | null = null;
+  private prompting: Promise<SubscribeResult> | null = null;
+  private closeActivePrompt: (() => void) | null = null;
+  private cleanups: Record<string, () => void> = {};
+  private swListenerInstalled = false;
   private warned = false;
-  /**
-   * In-memory mirror of the subscription token. Used as a fallback when
-   * localStorage throws (Safari private mode, quota exceeded) so the very
-   * next identify()/tag() call doesn't see no_subscription right after a
-   * successful subscribe() in the same session.
-   */
   private token: string | null = null;
 
   init(config: ReachBellConfig): void {
@@ -237,6 +352,7 @@ class ReachBellClient {
       this.log('init() called twice — ignoring. Pass force:true to override.');
       return;
     }
+    if (this.config) this.reset();
     this.config = {
       apiUrl:     DEFAULT_API_URL,
       swPath:     DEFAULT_SW_PATH,
@@ -244,6 +360,8 @@ class ReachBellClient {
       debug:      false,
       ...config,
     };
+    this.config.apiUrl = normalizeApiUrl(this.config.apiUrl || DEFAULT_API_URL);
+    this.config.swPath = this.config.swPath || DEFAULT_SW_PATH;
     this.log('Initialized', this.config);
     this.bootstrapping = this.bootstrap();
     void this.bootstrapping;
@@ -254,89 +372,182 @@ class ReachBellClient {
     return this.bootstrapping ?? Promise.reject(new Error('Call ReachBell.init() first'));
   }
 
+  private reset(): void {
+    Object.values(this.cleanups).forEach(cleanup => cleanup());
+    this.cleanups = {};
+    this.closeActivePrompt?.();
+    this.promptConfig = null;
+    this.serverContext = null;
+    this.swReg = null;
+    this.prompting = null;
+    this.token = null;
+  }
+
   private async bootstrap(): Promise<void> {
+    if (typeof window === 'undefined') return;
     try {
-      const ctx = await this.fetchContext();
-      this.serverContext = ctx;
-      this.promptConfig  = ctx.promptConfig ?? null;
+      await this.loadContext();
+    } catch (e) {
+      this.warnOnce('Could not load ReachBell settings — push notifications will not work on this page', e);
+      return;
+    }
+
+    try {
+      this.mountLayouts(this.serverContext?.customLayouts ?? {});
+    } catch (e) {
+      this.log('In-page widgets failed', e);
+    }
+
+    try {
       await this.registerServiceWorker();
+    } catch (e) {
+      this.warnOnce('Service worker registration failed — push notifications will not work on this page', e);
+    }
 
-      // 1. Mount In-Page Widgets (Announcement Banner, Notification Center, Corner Toast Alerts)
-      const layouts = ctx.customLayouts ?? {};
+    try {
+      this.armPromptUi();
+    } catch (e) {
+      this.log('Prompt setup failed', e);
+    }
 
-      // 1a. Announcement Banner
-      const banner = layouts.banner;
-      if (banner && banner.enabled !== false) {
+    await this.syncSubscription();
+  }
+
+  private async loadContext(): Promise<void> {
+    const ctx = await this.fetchContext();
+    this.serverContext = ctx;
+    this.promptConfig = ctx?.promptConfig ?? null;
+  }
+
+  private mountLayouts(layouts: any): void {
+    const banner = layouts?.banner;
+    if (widgetEnabled(banner)) {
+      const title = banner.message || banner.title || banner.headline;
+      if (title) {
         this.showBanner({
-          title: banner.message || banner.title || banner.headline || '🚀 Black Friday Sale — 30% OFF everything this weekend!',
-          body: banner.highlightText || banner.secondaryText || banner.body || '',
-          ctaText: banner.showCta !== false ? (banner.ctaText || 'Shop Now →') : undefined,
-          url: banner.ctaUrl || banner.url,
-          position: banner.position || 'top',
-          backgroundColor: banner.backgroundColor || 'linear-gradient(135deg, #6366f1 0%, #a855f7 100%)',
-          textColor: banner.textColor || '#ffffff',
-          dismissible: banner.dismissible !== false,
-          duration: banner.duration,
+          title,
+          body:            banner.highlightText || banner.secondaryText || banner.body || '',
+          ctaText:         banner.showCta !== false ? banner.ctaText || undefined : undefined,
+          url:             banner.ctaUrl || banner.url,
+          position:        banner.position === 'bottom' ? 'bottom' : 'top',
+          backgroundColor: banner.backgroundColor,
+          textColor:       banner.textColor,
+          dismissible:     banner.dismissible !== false,
+          duration:        banner.duration,
         });
       }
+    }
 
-      // 1b. Notification Center Bell
-      const notifCenter = layouts.notificationCenter;
-      if (notifCenter && notifCenter.enabled !== false) {
-        this.showNotificationCenter({
-          position: notifCenter.position || 'bottom-right',
-          accentColor: notifCenter.accentColor || '#6366f1',
-          title: notifCenter.title || 'Notifications',
-          maxItems: notifCenter.maxItems ?? 20,
-        });
-      }
+    const notifCenter = layouts?.notificationCenter;
+    if (widgetEnabled(notifCenter)) {
+      this.showNotificationCenter({
+        position:    notifCenter.position,
+        accentColor: notifCenter.accentColor,
+        title:       notifCenter.title,
+        maxItems:    notifCenter.maxItems,
+      });
+    }
 
-      // 1c. Corner Toast Alert
-      const toast = layouts.toast;
-      if (toast && toast.enabled !== false) {
+    const toast = layouts?.toast;
+    if (widgetEnabled(toast)) {
+      const title = toast.title || toast.message;
+      if (title) {
         const delaySec = typeof toast.delaySeconds === 'number' ? toast.delaySeconds : 2;
-        setTimeout(() => {
+        const timer = setTimeout(() => {
           this.showToast({
-            title: toast.title || 'Order Shipped 📦',
-            body: toast.message || toast.body || 'Your package has left the fulfillment warehouse and will arrive tomorrow.',
-            url: toast.actionUrl || toast.url,
-            accentColor: toast.accentColor || '#6366f1',
-            position: toast.position || 'bottom-right',
-            duration: typeof toast.duration === 'number' ? toast.duration * 1000 : 6000,
-            ctaText: toast.showCtaButton !== false ? (toast.ctaText || 'Track Order →') : undefined,
+            title,
+            body:        toast.title ? toast.message || toast.body : toast.body,
+            url:         toast.actionUrl || toast.url,
+            accentColor: toast.accentColor,
+            position:    toast.position,
+            duration:    typeof toast.duration === 'number' ? toast.duration : 6000,
+            ctaText:     toast.showCtaButton !== false ? toast.ctaText || undefined : undefined,
           });
         }, Math.max(0, delaySec * 1000));
+        this.cleanups.layoutToast = () => clearTimeout(timer);
       }
-
-      // 2. Opt-in Permission Prompt / Bell Widget
-      const isBellWidget = this.promptConfig?.type === 'bell_widget' || (this.promptConfig as any)?.bellWidget?.enabled;
-      if (this.promptConfig && this.promptConfig.enabled !== false && isBellWidget) {
-        this.mountBellWidget(this.promptConfig);
-      }
-      const shouldAutoPrompt = this.config?.autoPrompt === true || (this.config?.autoPrompt !== false && this.promptConfig?.enabled);
-      if (shouldAutoPrompt && !isBellWidget && this.promptConfig?.enabled) {
-        const delaySec = (this.promptConfig as any)?.delay ?? 1;
-        const delayMs = Math.max(0, delaySec * 1000);
-        setTimeout(() => {
-          if (typeof Notification === 'undefined' || Notification.permission === 'default') {
-            void this.prompt();
-          }
-        }, delayMs);
-      }
-    } catch (e) {
-      this.warnOnce('Bootstrap failed — push notifications will not work on this page', e);
-      this.log('Bootstrap failed', e);
     }
   }
 
-  private armAutoPromptOnGesture(): void {
+  private isBellWidget(cfg: PromptConfig | null): boolean {
+    return cfg?.type === 'bell_widget' || (cfg as any)?.bellWidget?.enabled === true;
+  }
+
+  private armPromptUi(): void {
+    const cfg = this.promptConfig;
+    if (!cfg || cfg.enabled !== true) return;
+    if (this.isBellWidget(cfg)) {
+      this.mountBellWidget(cfg);
+      return;
+    }
+    const autoPrompt = this.config?.autoPrompt === true || this.config?.autoPrompt === undefined;
+    if (!autoPrompt) return;
+    if (typeof Notification === 'undefined' || Notification.permission !== 'default') return;
+
+    const fire = () => {
+      if (Notification.permission !== 'default') return;
+      if (!promptFrequencyAllows(this.readPromptHistory(), Date.now(), cfg)) return;
+      void this.prompt();
+    };
+    const trigger = cfg.type === 'native' ? () => this.armAutoPromptOnGesture(fire) : fire;
+    this.afterPromptTriggers(cfg, trigger);
+  }
+
+  private afterPromptTriggers(cfg: PromptConfig, run: () => void): void {
+    const delayMs = Math.max(0, (typeof cfg.delay === 'number' ? cfg.delay : 1) * 1000);
+    const percent = typeof cfg.scrollPercent === 'number' ? Math.min(100, Math.max(0, cfg.scrollPercent)) : 0;
+    let removeScroll: (() => void) | null = null;
+    const timer = setTimeout(() => {
+      if (percent <= 0) {
+        run();
+        return;
+      }
+      const check = () => {
+        const doc = document.documentElement;
+        if (scrollProgress(window.scrollY || doc.scrollTop, doc.scrollHeight, window.innerHeight) < percent) return;
+        removeScroll?.();
+        run();
+      };
+      window.addEventListener('scroll', check, { passive: true });
+      removeScroll = () => window.removeEventListener('scroll', check);
+      check();
+    }, delayMs);
+    this.cleanups.promptTrigger = () => {
+      clearTimeout(timer);
+      removeScroll?.();
+    };
+  }
+
+  private readPromptHistory(): PromptHistory {
+    let shownAt: number[] = [];
+    try {
+      const parsed: unknown = JSON.parse(localStorage.getItem(PROMPT_SHOWS_KEY) ?? '[]');
+      if (Array.isArray(parsed)) shownAt = parsed.filter((item): item is number => typeof item === 'number');
+    } catch { }
+    let sessionShows = 0;
+    try {
+      sessionShows = Number(sessionStorage.getItem(SESSION_SHOWS_KEY) ?? 0) || 0;
+    } catch { }
+    return { sessionShows, lastShownAt: shownAt.length ? Math.max(...shownAt) : null, shownAt };
+  }
+
+  private recordPromptShow(now: number): void {
+    const history = this.readPromptHistory();
+    const kept = history.shownAt.filter(time => now - time < 365 * DAY_MS);
+    try { localStorage.setItem(PROMPT_SHOWS_KEY, JSON.stringify([...kept, now].slice(-50))); } catch { }
+    try { sessionStorage.setItem(SESSION_SHOWS_KEY, String(history.sessionShows + 1)); } catch { }
+  }
+
+  private armAutoPromptOnGesture(run: () => void): void {
     if (typeof document === 'undefined') return;
     const events = ['click', 'keydown', 'touchstart'] as const;
     const fire = () => {
-      events.forEach(ev => document.removeEventListener(ev, fire));
-      void this.prompt();
+      remove();
+      run();
     };
-    events.forEach(ev => document.addEventListener(ev, fire, { once: true, passive: true }));
+    const remove = () => events.forEach(ev => document.removeEventListener(ev, fire));
+    events.forEach(ev => document.addEventListener(ev, fire, { passive: true }));
+    this.cleanups.gesture = remove;
   }
 
   /**
@@ -377,23 +588,105 @@ class ReachBellClient {
   }
 
   private async registerServiceWorker(): Promise<void> {
-    if (!('serviceWorker' in navigator)) {
+    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
       this.log('Service workers not supported');
       return;
     }
-    this.swReg = await navigator.serviceWorker.register(this.config!.swPath!);
-    this.log('SW registered', this.swReg);
+    const reg = await navigator.serviceWorker.register(this.config!.swPath!);
+    this.swReg = reg;
+    this.log('SW registered', reg);
+    this.sendWorkerConfig(reg.active ?? reg.waiting ?? reg.installing);
+    void this.activeRegistration().then(active => this.sendWorkerConfig(active?.active));
+    this.listenToWorker();
+  }
+
+  private sendWorkerConfig(worker: ServiceWorker | null | undefined): void {
+    if (!worker || !this.config) return;
+    try { worker.postMessage({ type: 'REACHBELL_CONFIG', apiUrl: this.config.apiUrl }); } catch { }
+  }
+
+  private listenToWorker(): void {
+    if (this.swListenerInstalled || !navigator.serviceWorker?.addEventListener) return;
+    this.swListenerInstalled = true;
+    navigator.serviceWorker.addEventListener('message', event => {
+      const data = (event as MessageEvent).data;
+      if (!data || data.type !== 'REACHBELL_NOTIFICATION' || typeof data.notification?.title !== 'string') return;
+      const n = data.notification;
+      this.recordNotification({
+        id:      typeof n.id === 'string' ? n.id : undefined,
+        title:   n.title,
+        body:    typeof n.body === 'string' ? n.body : undefined,
+        url:     safeUrl(n.url) ?? undefined,
+        iconUrl: safeUrl(n.icon) ?? undefined,
+      });
+    });
+  }
+
+  private async activeRegistration(): Promise<ServiceWorkerRegistration | null> {
+    const reg = this.swReg;
+    if (!reg) return null;
+    if (reg.active) return reg;
+    const worker = reg.installing ?? reg.waiting;
+    if (!worker) return null;
+    await new Promise<void>(resolve => {
+      const done = () => {
+        clearTimeout(timer);
+        worker.removeEventListener('statechange', onChange);
+        resolve();
+      };
+      const onChange = () => {
+        if (worker.state === 'activated' || worker.state === 'redundant') done();
+      };
+      const timer = setTimeout(done, SW_ACTIVATE_TIMEOUT_MS);
+      worker.addEventListener('statechange', onChange);
+      onChange();
+    });
+    return reg.active ? reg : null;
+  }
+
+  private async syncSubscription(): Promise<void> {
+    if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+    if (!this.swReg || !this.serverContext?.vapidKeys?.public) return;
+    try {
+      const reg = await this.activeRegistration();
+      if (!reg) return;
+      const sub = await reg.pushManager.getSubscription();
+      const stale = !sub
+        || !sameApplicationServerKey(sub.options?.applicationServerKey, this.serverContext.vapidKeys.public)
+        || !this.readToken()
+        || this.readEndpoint() !== sub.endpoint;
+      if (!stale) return;
+      const result = await this.subscribe();
+      if (!result.success) this.log('Subscription sync failed', result.reason);
+    } catch (e) {
+      this.log('Subscription sync failed', e);
+    }
   }
 
   async prompt(): Promise<SubscribeResult> {
     if (!this.config) return { success: false, reason: 'sdk_not_initialized' };
-
-    // Wait for the in-flight bootstrap so prompt() called immediately after
-    // init() doesn't race a missing serverContext / swReg.
     if (this.bootstrapping) {
-      try { await this.bootstrapping; } catch { /* already warned */ }
+      try { await this.bootstrapping; } catch { }
     }
-    if (!('PushManager' in window)) return { success: false, reason: 'push_not_supported' };
+    if (this.prompting) return this.prompting;
+    this.prompting = this.runPrompt().finally(() => { this.prompting = null; });
+    return this.prompting;
+  }
+
+  private async runPrompt(): Promise<SubscribeResult> {
+    if (typeof window === 'undefined' || !('PushManager' in window) || typeof Notification === 'undefined') {
+      return { success: false, reason: 'push_not_supported' };
+    }
+    if (Notification.permission === 'denied') return { success: false, reason: 'permission_denied' };
+
+    if (!this.serverContext) {
+      try {
+        await this.loadContext();
+      } catch {
+        return { success: false, reason: 'not_ready' };
+      }
+    }
+    if (!this.serverContext?.vapidKeys?.public) return { success: false, reason: 'not_ready' };
 
     if (!this.swReg) {
       try {
@@ -401,11 +694,18 @@ class ReachBellClient {
       } catch (e: any) {
         return { success: false, reason: `sw_register_failed_${e?.name ?? 'unknown'}` };
       }
+      if (!this.swReg) return { success: false, reason: 'push_not_supported' };
     }
 
-    if (this.promptConfig?.enabled && this.promptConfig.type !== 'native') {
-      const accepted = await this.showCustomPrompt(this.promptConfig);
+    if (Notification.permission === 'granted') return this.subscribe();
+
+    const cfg = this.promptConfig;
+    if (cfg?.enabled === true && cfg.type !== 'native' && !this.isBellWidget(cfg)) {
+      this.recordPromptShow(Date.now());
+      const accepted = await this.showCustomPrompt(cfg);
       if (!accepted) return { success: false, reason: 'user_declined_soft_prompt' };
+    } else {
+      this.recordPromptShow(Date.now());
     }
 
     const permission = await Notification.requestPermission();
@@ -415,17 +715,23 @@ class ReachBellClient {
   }
 
   private async subscribe(): Promise<SubscribeResult> {
-    if (!this.swReg || !this.serverContext) return { success: false, reason: 'not_ready' };
+    const publicKey: string | undefined = this.serverContext?.vapidKeys?.public;
+    if (!this.swReg || !publicKey) return { success: false, reason: 'not_ready' };
+    const reg = await this.activeRegistration();
+    if (!reg) return { success: false, reason: 'sw_not_active' };
+
     let sub: PushSubscription;
     try {
-      sub = await this.swReg.pushManager.subscribe({
+      let existing = await reg.pushManager.getSubscription();
+      if (existing && !sameApplicationServerKey(existing.options?.applicationServerKey, publicKey)) {
+        await existing.unsubscribe();
+        existing = null;
+      }
+      sub = existing ?? await reg.pushManager.subscribe({
         userVisibleOnly: true,
-        applicationServerKey: urlBase64ToUint8Array(this.serverContext.vapidKeys.public),
+        applicationServerKey: urlBase64ToUint8Array(publicKey),
       });
     } catch (e: any) {
-      // NotAllowedError, AbortError, InvalidStateError, InvalidAccessError,
-      // and missing/malformed VAPID keys all land here. Map to a specific
-      // reason so the integrator can branch on what failed.
       return { success: false, reason: `push_subscribe_failed_${e?.name ?? 'unknown'}` };
     }
 
@@ -433,9 +739,6 @@ class ReachBellClient {
       const res = await this.request('/subscribers', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        // `subscription` is the canonical structured shape. `token` is kept
-        // as the legacy double-stringified form so an older API stays
-        // compatible during rollout — remove from the wire format in v2.
         body: JSON.stringify({
           subscription: sub.toJSON(),
           token:        JSON.stringify(sub),
@@ -445,14 +748,43 @@ class ReachBellClient {
       if (!res.ok) return { success: false, reason: `subscribe_failed_${res.status}` };
       const data = await res.json();
       const t: string | null = data.token ?? null;
-      this.token = t;
-      // Safari private mode + quota-exceeded both throw here. The in-memory
-      // mirror above keeps identify()/tag() working for the session anyway.
-      try { if (t) localStorage.setItem(TOKEN_KEY, t); } catch { /* fall back to memory */ }
+      this.storeToken(t, sub.endpoint);
       return { success: true, token: t ?? undefined };
     } catch (e: any) {
       return { success: false, reason: e?.name === 'AbortError' ? 'timed_out' : 'network_error' };
     }
+  }
+
+  async unsubscribe(): Promise<ApiResult> {
+    if (!this.config) return { ok: false, reason: 'sdk_not_initialized' };
+    try {
+      const reg = this.swReg ?? null;
+      const sub = reg ? await reg.pushManager.getSubscription() : null;
+      if (sub) await sub.unsubscribe();
+      this.storeToken(null, null);
+      return { ok: true };
+    } catch (e: any) {
+      return { ok: false, reason: `unsubscribe_failed_${e?.name ?? 'unknown'}` };
+    }
+  }
+
+  private tokenKey(): string {
+    return `${TOKEN_KEY}:${this.config?.apiKey ?? ''}`;
+  }
+
+  private storeToken(token: string | null, endpoint: string | null): void {
+    this.token = token;
+    try {
+      if (token) localStorage.setItem(this.tokenKey(), token);
+      else localStorage.removeItem(this.tokenKey());
+      if (endpoint) localStorage.setItem(`${ENDPOINT_KEY}:${this.config?.apiKey ?? ''}`, endpoint);
+      else localStorage.removeItem(`${ENDPOINT_KEY}:${this.config?.apiKey ?? ''}`);
+      localStorage.removeItem(TOKEN_KEY);
+    } catch { }
+  }
+
+  private readEndpoint(): string | null {
+    try { return localStorage.getItem(`${ENDPOINT_KEY}:${this.config?.apiKey ?? ''}`); } catch { return null; }
   }
 
   async identify(externalId: string): Promise<ApiResult> {
@@ -501,17 +833,20 @@ class ReachBellClient {
   showToast(opts: ToastOptions): () => void {
     if (typeof document === 'undefined') return () => {};
     const defaults = this.serverContext?.customLayouts?.toast ?? {};
-    const pos = opts.position ?? defaults.position ?? 'bottom-right';
+    const titleText = opts.title || opts.message || '';
+    if (!titleText) return () => {};
+    const pos: ToastPosition = (['top-left', 'top-right', 'bottom-left', 'bottom-right'] as const).includes(opts.position ?? defaults.position)
+      ? (opts.position ?? defaults.position)
+      : 'bottom-right';
     const layer = this.ensureToastLayer(pos);
     const accent  = safeColor(opts.accentColor ?? defaults.accentColor, DEFAULT_ACCENT);
     const duration = typeof opts.duration === 'number'
       ? Math.max(0, opts.duration)
       : (typeof defaults.duration === 'number' ? defaults.duration : 6000);
 
-    const titleText = opts.title || (opts as any).message || defaults.title || 'Order Shipped 📦';
-    const bodyText = opts.body || (opts as any).message || defaults.message || 'Your package has left the fulfillment warehouse and will arrive tomorrow.';
-    const targetUrl = opts.url || (opts as any).actionUrl || defaults.actionUrl;
-    const ctaText = opts.ctaText || defaults.ctaText;
+    const bodyText = opts.body || (opts.title ? opts.message : '') || '';
+    const targetUrl = safeUrl(opts.url || opts.actionUrl);
+    const ctaText = opts.ctaText;
 
     const card = document.createElement('div');
     Object.assign(card.style, {
@@ -530,7 +865,9 @@ class ReachBellClient {
       opacity:      '0',
       transform:    'translateY(8px)',
       boxSizing:    'border-box',
+      pointerEvents: 'auto',
     });
+    card.setAttribute('role', 'status');
 
     const topRow = document.createElement('div');
     Object.assign(topRow.style, { display: 'flex', gap: '10px', alignItems: 'flex-start', width: '100%' });
@@ -607,7 +944,7 @@ class ReachBellClient {
     close.addEventListener('click', e => { e.stopPropagation(); dismiss(); });
     if (targetUrl) {
       card.addEventListener('click', () => {
-        try { window.location.href = targetUrl; } catch { /* navigation blocked */ }
+        try { window.location.href = targetUrl; } catch {}
         dismiss();
       });
     }
@@ -642,7 +979,7 @@ class ReachBellClient {
     // Pin to the appropriate corner.
     if (position.startsWith('top'))    layer.style.top    = '20px';
     if (position === 'bottom-right') {
-      const hasNotifCenter = this.serverContext?.customLayouts?.notificationCenter?.enabled !== false;
+      const hasNotifCenter = !!document.getElementById('reachbell-notification-center');
       layer.style.bottom = hasNotifCenter ? '76px' : '20px';
       layer.style.right  = '20px';
     } else {
@@ -650,12 +987,6 @@ class ReachBellClient {
       if (position.endsWith('right'))    layer.style.right  = '20px';
       if (position.endsWith('left'))     layer.style.left   = '20px';
     }
-
-    // Children inherit pointer-events: auto so cards remain interactive
-    // while the layer itself doesn't block clicks elsewhere on the page.
-    const style = document.createElement('style');
-    style.textContent = `#${id} > * { pointer-events: auto; }`;
-    layer.appendChild(style);
 
     document.body.appendChild(layer);
     return layer;
@@ -719,17 +1050,15 @@ class ReachBellClient {
   showBanner(opts: BannerOptions): () => void {
     if (typeof document === 'undefined') return () => {};
 
-    const defaults = this.serverContext?.customLayouts?.banner ?? {};
-    const position = opts.position ?? defaults.position ?? 'top';
-    const dismissible = opts.dismissible !== undefined
-      ? opts.dismissible
-      : (defaults.dismissible !== undefined ? defaults.dismissible : true);
-    const bg   = opts.backgroundColor || defaults.backgroundColor || 'linear-gradient(135deg, #6366f1 0%, #a855f7 100%)';
-    const text = safeColor(opts.textColor ?? defaults.textColor, '#ffffff');
-    const headline = opts.title || opts.message || opts.headline || defaults.message || '🚀 Black Friday Sale — 30% OFF everything this weekend!';
-    const sub = opts.body || opts.highlightText || opts.secondaryText || defaults.highlightText || '';
-    const cta = opts.ctaText || defaults.ctaText || (defaults.showCta !== false ? 'Shop Now →' : undefined);
-    const targetUrl = opts.url || opts.ctaUrl || defaults.ctaUrl;
+    const position: BannerPosition = opts.position === 'bottom' ? 'bottom' : 'top';
+    const dismissible = opts.dismissible !== false;
+    const bg   = safeBackground(opts.backgroundColor, DEFAULT_ACCENT);
+    const text = safeColor(opts.textColor, '#ffffff');
+    const headline = opts.title || opts.message || opts.headline || '';
+    if (!headline) return () => {};
+    const sub = opts.body || opts.highlightText || opts.secondaryText || '';
+    const cta = opts.ctaText;
+    const targetUrl = safeUrl(opts.url || opts.ctaUrl);
 
     // Only one banner per position. Replacing dismisses the previous so
     // the page never accumulates a stack of overlapping bars.
@@ -800,8 +1129,8 @@ class ReachBellClient {
       Object.assign(ctaBtn.style, {
         padding:       '5px 14px',
         borderRadius:  '999px',
-        background:    opts.ctaButtonColor || '#ffffff',
-        color:         opts.ctaButtonTextColor || '#0f172a',
+        background:    safeColor(opts.ctaButtonColor, '#ffffff'),
+        color:         safeColor(opts.ctaButtonTextColor, '#0f172a'),
         fontWeight:    '700',
         fontSize:      '11px',
         border:        '0',
@@ -818,6 +1147,7 @@ class ReachBellClient {
         if (targetUrl) {
           try { window.location.href = targetUrl; } catch {}
         }
+        dismiss();
       });
       rightActions.appendChild(ctaBtn);
     }
@@ -847,16 +1177,16 @@ class ReachBellClient {
 
     if (targetUrl && !cta) {
       bar.addEventListener('click', () => {
-        try { window.location.href = targetUrl; } catch { /* navigation blocked */ }
+        try { window.location.href = targetUrl; } catch {}
       });
     }
 
+    bar.setAttribute('role', 'region');
+    bar.setAttribute('aria-label', headline);
     document.body.appendChild(bar);
     requestAnimationFrame(() => { bar.style.transform = 'translateY(0)'; });
 
-    const duration = typeof opts.duration === 'number'
-      ? opts.duration
-      : (typeof defaults.duration === 'number' ? defaults.duration : 0);
+    const duration = typeof opts.duration === 'number' ? opts.duration : 0;
     if (duration > 0) setTimeout(dismiss, duration);
 
     return dismiss;
@@ -923,25 +1253,16 @@ class ReachBellClient {
    */
   showNotificationCenter(opts: NotificationCenterOptions = {}): () => void {
     if (typeof document === 'undefined') return () => {};
-    const defaults = this.serverContext?.customLayouts?.notificationCenter ?? {};
-    const position = opts.position ?? defaults.position ?? 'bottom-right';
-    const accent   = safeColor(opts.accentColor ?? defaults.accentColor, DEFAULT_ACCENT);
-    const maxItems = opts.maxItems ?? defaults.maxItems ?? 20;
-    const heading  = opts.title ?? defaults.title ?? 'Notifications';
+    const position: ToastPosition = (['top-left', 'top-right', 'bottom-left', 'bottom-right'] as const).includes(opts.position as ToastPosition)
+      ? opts.position as ToastPosition
+      : 'bottom-right';
+    const accent   = safeColor(opts.accentColor, DEFAULT_ACCENT);
+    const maxItems = typeof opts.maxItems === 'number' && opts.maxItems > 0 ? opts.maxItems : 20;
+    const heading  = opts.title || 'Notifications';
     const emptyTx  = opts.emptyText ?? 'No notifications yet.';
 
-    // Seed initial welcome alert if feed history is fresh
-    if (this.readNotificationHistory().length === 0) {
-      this.recordNotification({
-        id: 'nh_welcome',
-        title: '🎉 Welcome to Notifications',
-        body: 'Special offers, order dispatches, and timely alerts will appear here.',
-        receivedAt: Date.now(),
-        read: false,
-      });
-    }
-
     const id = 'reachbell-notification-center';
+    this.cleanups.notificationCenter?.();
     document.getElementById(id)?.remove();
 
     const root = document.createElement('div');
@@ -964,7 +1285,9 @@ class ReachBellClient {
       display: 'flex', alignItems: 'center', justifyContent: 'center',
       padding: '0', position: 'relative',
     });
+    bell.type = 'button';
     bell.setAttribute('aria-label', heading);
+    bell.setAttribute('aria-expanded', 'false');
     // Inline SVG — no external asset, no remote font.
     bell.innerHTML =
       '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">'
@@ -1012,6 +1335,7 @@ class ReachBellClient {
       background: 'transparent', border: '0', color: '#64748b',
       cursor: 'pointer', fontSize: '11.5px', fontWeight: '600',
     });
+    clear.type = 'button';
     clear.textContent = 'Clear';
     header.append(title, clear);
 
@@ -1071,8 +1395,9 @@ class ReachBellClient {
           item.read = true;
           this.markRead(item.id);
           render();
-          if (item.url) {
-            try { window.location.href = item.url; } catch { /* navigation blocked */ }
+          const itemUrl = safeUrl(item.url);
+          if (itemUrl) {
+            try { window.location.href = itemUrl; } catch {}
           }
         });
         list.appendChild(row);
@@ -1083,6 +1408,7 @@ class ReachBellClient {
     const toggle = () => {
       open = !open;
       panel.style.display = open ? 'flex' : 'none';
+      bell.setAttribute('aria-expanded', String(open));
       if (open) render();
     };
     bell.addEventListener('click', toggle);
@@ -1097,22 +1423,26 @@ class ReachBellClient {
       if (!root.contains(ev.target as Node)) {
         open = false;
         panel.style.display = 'none';
+        bell.setAttribute('aria-expanded', 'false');
       }
     };
     document.addEventListener('click', outside);
 
     // Live update when recordNotification() fires while open.
-    const liveHandler = () => { if (open) render(); else { render(); /* still updates the badge */ } };
+    const liveHandler = () => render();
     window.addEventListener('reachbell:notification-recorded', liveHandler);
 
     // Initial badge render so unread count is visible immediately.
     render();
 
-    return () => {
+    const cleanup = () => {
       document.removeEventListener('click', outside);
       window.removeEventListener('reachbell:notification-recorded', liveHandler);
       root.remove();
+      if (this.cleanups.notificationCenter === cleanup) delete this.cleanups.notificationCenter;
     };
+    this.cleanups.notificationCenter = cleanup;
+    return cleanup;
   }
 
   /**
@@ -1127,6 +1457,7 @@ class ReachBellClient {
   private mountBellWidget(cfg: any): () => void {
     if (typeof document === 'undefined') return () => {};
     const id = 'reachbell-bell-widget';
+    this.cleanups.bellWidget?.();
     document.getElementById(id)?.remove();
 
     const position = cfg.position || cfg.bellWidget?.position || 'bottom-right';
@@ -1136,31 +1467,8 @@ class ReachBellClient {
     const tooltipText = cfg.bellTooltip || cfg.bellWidget?.tooltipText || 'Enable notifications';
     const pulse = cfg.bellPulse !== false && cfg.bellWidget?.pulseAnimation !== false;
 
-    if (!document.getElementById('reachbell-bell-styles')) {
-      const style = document.createElement('style');
-      style.id = 'reachbell-bell-styles';
-      style.textContent = `
-        @keyframes rb-bell-ping {
-          0% { transform: scale(1); opacity: 0.6; }
-          75%, 100% { transform: scale(1.6); opacity: 0; }
-        }
-        .rb-bell-pulse {
-          position: absolute; inset: 0; border-radius: 9999px;
-          animation: rb-bell-ping 2s cubic-bezier(0, 0, 0.2, 1) infinite;
-          pointer-events: none;
-        }
-        .rb-bell-btn:hover .rb-bell-tooltip {
-          opacity: 1 !important;
-          transform: translateY(0) !important;
-          pointer-events: auto !important;
-        }
-      `;
-      document.head.appendChild(style);
-    }
-
     const container = document.createElement('div');
     container.id = id;
-    container.className = 'rb-bell-btn';
     Object.assign(container.style, {
       position: 'fixed',
       zIndex: '2147483640',
@@ -1171,14 +1479,20 @@ class ReachBellClient {
       transition: 'transform 0.2s ease',
     });
 
-    if (position.startsWith('top'))    container.style.top    = '20px';
-    if (position.startsWith('bottom')) container.style.bottom = '20px';
-    if (position.endsWith('right'))    container.style.right  = '20px';
-    if (position.endsWith('left'))     container.style.left   = '20px';
+    const center = document.getElementById('reachbell-notification-center');
+    const sharesCorner = !!center
+      && (position.startsWith('top') ? center.style.top : center.style.bottom) === '20px'
+      && (position.endsWith('left') ? center.style.left : center.style.right) === '20px';
+    const edgeOffset = sharesCorner ? '76px' : '20px';
+    if (position.startsWith('top')) container.style.top = edgeOffset;
+    else container.style.bottom = edgeOffset;
+    if (position.endsWith('left')) container.style.left = '20px';
+    else container.style.right = '20px';
 
+    let tooltip: HTMLDivElement | null = null;
     if (tooltipText) {
-      const tooltip = document.createElement('div');
-      tooltip.className = 'rb-bell-tooltip';
+      tooltip = document.createElement('div');
+      tooltip.setAttribute('aria-hidden', 'true');
       Object.assign(tooltip.style, {
         padding: '6px 12px',
         borderRadius: '8px',
@@ -1197,6 +1511,11 @@ class ReachBellClient {
       tooltip.textContent = tooltipText;
       container.appendChild(tooltip);
     }
+    const showTooltip = (visible: boolean) => {
+      if (!tooltip) return;
+      tooltip.style.opacity = visible ? '1' : '0';
+      tooltip.style.transform = visible ? 'translateY(0)' : 'translateY(4px)';
+    };
 
     const btnWrap = document.createElement('div');
     Object.assign(btnWrap.style, {
@@ -1207,9 +1526,22 @@ class ReachBellClient {
 
     if (pulse) {
       const pulseRing = document.createElement('div');
-      pulseRing.className = 'rb-bell-pulse';
-      pulseRing.style.background = accent;
+      Object.assign(pulseRing.style, {
+        position: 'absolute', inset: '0', borderRadius: '9999px',
+        background: accent, pointerEvents: 'none', opacity: '0',
+      });
       btnWrap.appendChild(pulseRing);
+      const reduceMotion = typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      if (!reduceMotion && typeof pulseRing.animate === 'function') {
+        pulseRing.animate(
+          [
+            { transform: 'scale(1)', opacity: 0.6 },
+            { transform: 'scale(1.6)', opacity: 0, offset: 0.75 },
+            { transform: 'scale(1.6)', opacity: 0 },
+          ],
+          { duration: 2000, iterations: Infinity, easing: 'cubic-bezier(0, 0, 0.2, 1)' },
+        );
+      }
     }
 
     const button = document.createElement('button');
@@ -1239,39 +1571,46 @@ class ReachBellClient {
 
     button.addEventListener('mouseenter', () => {
       button.style.transform = 'scale(1.08)';
+      showTooltip(true);
     });
     button.addEventListener('mouseleave', () => {
       button.style.transform = 'scale(1)';
+      showTooltip(false);
     });
+    button.addEventListener('focus', () => showTooltip(true));
+    button.addEventListener('blur', () => showTooltip(false));
 
     button.addEventListener('click', async () => {
-      if (typeof Notification !== 'undefined') {
-        if (Notification.permission === 'granted') {
-          this.showToast({
-            title: 'Notifications Active',
-            body: 'You are subscribed to receive updates from this site.',
-            duration: 3500,
-            accentColor: accent,
-          });
-          return;
-        } else if (Notification.permission === 'denied') {
-          this.showToast({
-            title: 'Notifications Blocked',
-            body: 'Notifications are blocked in your browser settings. Click the site settings icon to allow.',
-            duration: 5000,
-            accentColor: '#ef4444',
-          });
-          return;
-        }
+      if (typeof Notification !== 'undefined' && Notification.permission === 'denied') {
+        this.showToast({
+          title: 'Notifications Blocked',
+          body: 'Notifications are blocked in your browser settings. Click the site settings icon to allow.',
+          duration: 5000,
+          accentColor: '#ef4444',
+        });
+        return;
       }
-      await this.prompt();
+      const result = await this.prompt();
+      if (result.success) {
+        this.showToast({
+          title: 'Notifications Active',
+          body: 'You are subscribed to receive updates from this site.',
+          duration: 3500,
+          accentColor: accent,
+        });
+      }
     });
 
     btnWrap.appendChild(button);
     container.appendChild(btnWrap);
     document.body.appendChild(container);
 
-    return () => container.remove();
+    const cleanup = () => {
+      container.remove();
+      if (this.cleanups.bellWidget === cleanup) delete this.cleanups.bellWidget;
+    };
+    this.cleanups.bellWidget = cleanup;
+    return cleanup;
   }
 
   private markRead(id: string): void {
@@ -1298,7 +1637,7 @@ class ReachBellClient {
   private readToken(): string | null {
     if (this.token) return this.token;
     try {
-      const t = localStorage.getItem(TOKEN_KEY);
+      const t = localStorage.getItem(this.tokenKey()) ?? localStorage.getItem(TOKEN_KEY);
       if (t) this.token = t;
       return t;
     } catch {
@@ -1315,14 +1654,15 @@ class ReachBellClient {
    */
   private async showCustomPrompt(cfg: PromptConfig): Promise<boolean> {
     return new Promise(resolve => {
-      // Clean up any existing prompt before showing a new one
+      this.closeActivePrompt?.();
       document.getElementById('reachbell-custom-prompt')?.remove();
 
       const accent = safeColor(cfg.accentColor, DEFAULT_ACCENT);
-      const rawPos = cfg.position || (cfg as any).softPrompt?.position || 'bottom-center';
-      const pos = rawPos.toLowerCase().replace(/_/g, '-');
+      const pos = resolvePromptPlacement(cfg.position || cfg.softPrompt?.position);
       const isCenterModal = pos === 'center-modal';
-      const isTopBar = pos === 'top-bar' || pos === 'banner';
+      const isTopBar = pos === 'top-bar';
+      const overlayEnabled = (cfg.overlayEnabled ?? cfg.softPrompt?.overlayEnabled) !== false;
+      const overlayColor = safeColor(cfg.overlayColor ?? cfg.softPrompt?.overlayColor, 'rgba(15, 23, 42, 0.48)');
 
       const allowBg = safeColor(cfg.allowButtonBackground || cfg.accentColor, accent);
       const allowColor = safeColor(cfg.allowButtonTextColor || cfg.buttonTextColor, '#ffffff');
@@ -1351,6 +1691,10 @@ class ReachBellClient {
 
       const root = document.createElement('div');
       root.id = 'reachbell-custom-prompt';
+      const titleId = 'reachbell-custom-prompt-title';
+      root.setAttribute('role', isCenterModal ? 'alertdialog' : 'dialog');
+      root.setAttribute('aria-labelledby', titleId);
+      if (isCenterModal && overlayEnabled) root.setAttribute('aria-modal', 'true');
       Object.assign(root.style, {
         position: 'fixed',
         zIndex:   '2147483647',
@@ -1362,15 +1706,15 @@ class ReachBellClient {
           inset: '0',
           width: '100vw',
           height: '100vh',
-          background: 'rgba(15, 23, 42, 0.48)',
-          backdropFilter: 'blur(4px)',
-          WebkitBackdropFilter: 'blur(4px)',
+          background: overlayEnabled ? overlayColor : 'transparent',
+          backdropFilter: overlayEnabled ? 'blur(4px)' : 'none',
+          WebkitBackdropFilter: overlayEnabled ? 'blur(4px)' : 'none',
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
           padding: '16px',
           boxSizing: 'border-box',
-          pointerEvents: 'auto',
+          pointerEvents: overlayEnabled ? 'auto' : 'none',
         });
       } else if (isTopBar) {
         Object.assign(root.style, {
@@ -1384,11 +1728,11 @@ class ReachBellClient {
         Object.assign(root.style, {
           pointerEvents: 'none',
         });
-        if (pos.startsWith('bottom')) root.style.bottom = '24px';
-        if (pos.startsWith('top'))    root.style.top    = '24px';
-        if (pos.includes('center'))   { root.style.left = '50%'; root.style.transform = 'translateX(-50%)'; }
-        if (pos.endsWith('left'))     root.style.left  = '24px';
-        if (pos.endsWith('right'))    root.style.right = '24px';
+        if (pos.startsWith('top')) root.style.top = '24px';
+        else root.style.bottom = '24px';
+        if (pos.endsWith('left'))       root.style.left  = '24px';
+        else if (pos.endsWith('right')) root.style.right = '24px';
+        else { root.style.left = '50%'; root.style.transform = 'translateX(-50%)'; }
       }
 
       if (isTopBar) {
@@ -1437,7 +1781,16 @@ class ReachBellClient {
 
         const bannerText = document.createElement('div');
         Object.assign(bannerText.style, { fontSize: '13px', lineHeight: '1.4', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' });
-        bannerText.innerHTML = `<strong>${escapeHtml(cfg.title || DEFAULT_TITLE)}</strong>: <span style="opacity: 0.85;">${escapeHtml(cfg.body || '')}</span>`;
+        const bannerTitle = document.createElement('strong');
+        bannerTitle.id = titleId;
+        bannerTitle.textContent = cfg.title || DEFAULT_TITLE;
+        bannerText.appendChild(bannerTitle);
+        if (cfg.body) {
+          const bannerBody = document.createElement('span');
+          bannerBody.style.opacity = '0.85';
+          bannerBody.textContent = `: ${cfg.body}`;
+          bannerText.appendChild(bannerBody);
+        }
         leftCol.appendChild(bannerText);
         banner.appendChild(leftCol);
 
@@ -1450,6 +1803,7 @@ class ReachBellClient {
           border: '0', padding: '7px 16px', borderRadius: `${allowRadius}px`,
           background: allowBg, color: allowColor, fontWeight: '700', fontSize: '12.5px', cursor: 'pointer',
         });
+        allowBtn.type = 'button';
         allowBtn.textContent = cfg.acceptText || DEFAULT_ACCEPT;
         rightCol.appendChild(allowBtn);
 
@@ -1459,6 +1813,7 @@ class ReachBellClient {
           border: `1px solid ${declineBorder}`, padding: '7px 14px', borderRadius: `${declineRadius}px`,
           background: declineBg, color: declineColor, fontWeight: '600', fontSize: '12.5px', cursor: 'pointer',
         });
+        dismissBtn.type = 'button';
         dismissBtn.textContent = cfg.declineText || DEFAULT_DECLINE;
         rightCol.appendChild(dismissBtn);
 
@@ -1525,7 +1880,8 @@ class ReachBellClient {
         Object.assign(titleEl.style, {
           fontWeight: '800', color: cardText, fontSize: '14.5px', lineHeight: '1.3',
         });
-        titleEl.textContent = cfg.title ?? DEFAULT_TITLE;
+        titleEl.id = titleId;
+        titleEl.textContent = cfg.title || DEFAULT_TITLE;
         textCol.appendChild(titleEl);
 
         const bodyEl = document.createElement('div');
@@ -1552,7 +1908,8 @@ class ReachBellClient {
         });
         closeBtn.onmouseenter = () => { closeBtn.style.opacity = '0.9'; };
         closeBtn.onmouseleave = () => { closeBtn.style.opacity = '0.45'; };
-        closeBtn.innerHTML = '✕';
+        closeBtn.type = 'button';
+        closeBtn.textContent = '✕';
         row.appendChild(closeBtn);
 
         const buttons = document.createElement('div');
@@ -1566,7 +1923,8 @@ class ReachBellClient {
           background: allowBg, color: allowColor, fontWeight: '700', fontSize: '13px', cursor: 'pointer',
           boxShadow: '0 4px 12px ' + allowBg + '40',
         });
-        acceptBtn.textContent = cfg.acceptText ?? DEFAULT_ACCEPT;
+        acceptBtn.type = 'button';
+        acceptBtn.textContent = cfg.acceptText || DEFAULT_ACCEPT;
         buttons.appendChild(acceptBtn);
 
         const declineBtn = document.createElement('button');
@@ -1575,7 +1933,8 @@ class ReachBellClient {
           flex: '1', border: `1px solid ${declineBorder}`, padding: '9px 14px', borderRadius: `${declineRadius}px`,
           background: declineBg, color: declineColor, fontWeight: '700', fontSize: '13px', cursor: 'pointer',
         });
-        declineBtn.textContent = cfg.declineText ?? DEFAULT_DECLINE;
+        declineBtn.type = 'button';
+        declineBtn.textContent = cfg.declineText || DEFAULT_DECLINE;
         buttons.appendChild(declineBtn);
 
         if ((cfg as any).showPoweredBy !== false) {
@@ -1584,23 +1943,60 @@ class ReachBellClient {
             marginTop: '10px', paddingTop: '8px', borderTop: '1px solid rgba(148, 163, 184, 0.15)',
             fontSize: '10.5px', textAlign: 'center', color: cardText, opacity: '0.6',
           });
-          poweredBy.innerHTML = 'Powered by <strong style="color: #2563EB;">ReachBell</strong>';
+          poweredBy.append('Powered by ');
+          const brand = document.createElement('strong');
+          brand.style.color = DEFAULT_ACCENT;
+          brand.textContent = 'ReachBell';
+          poweredBy.appendChild(brand);
           card.appendChild(poweredBy);
         }
       }
 
+      const previousFocus = document.activeElement as HTMLElement | null;
+      let settled = false;
+      const finish = (accepted: boolean) => {
+        if (settled) return;
+        settled = true;
+        document.removeEventListener('keydown', onKey, true);
+        root.remove();
+        if (this.closeActivePrompt === close) this.closeActivePrompt = null;
+        try { previousFocus?.focus?.(); } catch {}
+        resolve(accepted);
+      };
+      const close = () => finish(false);
+      const onKey = (e: KeyboardEvent) => {
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          finish(false);
+          return;
+        }
+        if (e.key !== 'Tab' || !(isCenterModal && overlayEnabled)) return;
+        const focusable = Array.from(root.querySelectorAll('button'));
+        if (!focusable.length) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        const active = document.activeElement;
+        if (e.shiftKey && (active === first || !root.contains(active))) {
+          e.preventDefault();
+          last.focus();
+        } else if (!e.shiftKey && (active === last || !root.contains(active))) {
+          e.preventDefault();
+          first.focus();
+        }
+      };
+      this.closeActivePrompt = close;
+      document.addEventListener('keydown', onKey, true);
       document.body.appendChild(root);
       root.addEventListener('click', e => {
         const target = e.target as HTMLElement;
         const action = target.closest('button')?.dataset.action;
         if (action === 'accept' || action === 'decline') {
-          root.remove();
-          resolve(action === 'accept');
-        } else if (isCenterModal && target === root) {
-          root.remove();
-          resolve(false);
+          finish(action === 'accept');
+        } else if (isCenterModal && overlayEnabled && target === root) {
+          finish(false);
         }
       });
+      if (isCenterModal) root.querySelector<HTMLButtonElement>('button[data-action="accept"]')?.focus({ preventScroll: true });
     });
   }
 

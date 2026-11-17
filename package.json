@@ -1,6 +1,6 @@
 {
   "name": "@reachbell/sdk",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "description": "ReachBell official browser SDK — push notifications, email subscriptions, and user identification.",
   "main": "dist/index.cjs",
   "module": "dist/index.mjs",
@@ -12,14 +12,16 @@
       "require": "./dist/index.cjs",
       "default": "./dist/index.mjs"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./iife": "./dist/index.iife.js",
+    "./dist/index.iife.js": "./dist/index.iife.js"
   },
   "sideEffects": [
     "./dist/index.cjs",
     "./dist/index.mjs"
   ],
   "bin": {
-    "reachbell": "./bin/reachbell.js"
+    "reachbell": "bin/reachbell.js"
   },
   "files": [
     "dist",
@@ -47,7 +49,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/reachbell/reachbell-sdk"
+    "url": "git+https://github.com/reachbell/reachbell-sdk.git"
   },
   "bugs": {
     "url": "https://github.com/reachbell/reachbell-sdk/issues"
