@@ -11,6 +11,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   escapeHtml, safeColor, urlBase64ToUint8Array, ReachBell, resolvePromptPlacement, promptCapAllows,
   promptFrequencyAllows, widgetEnabled, safeUrl, safeBackground, normalizeApiUrl, scrollProgress, sameApplicationServerKey,
+  nativePromptNeedsGesture,
 } from './index';
 
 describe('escapeHtml', () => {
@@ -439,5 +440,28 @@ describe('token storage', () => {
     (ReachBell as any).config = { apiKey: 'project_b', apiUrl: 'https://x.test' };
     (ReachBell as any).token = null;
     expect((ReachBell as any).readToken()).toBeNull();
+  });
+});
+
+describe('nativePromptNeedsGesture', () => {
+  const CHROME = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36';
+  const EDGE = `${CHROME} Edg/142.0.0.0`;
+  const SAFARI = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.0 Safari/605.1.15';
+  const FIREFOX = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:145.0) Gecko/20100101 Firefox/145.0';
+  const IOS_CHROME = 'Mozilla/5.0 (iPhone; CPU iPhone OS 19_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/142.0 Mobile/15E148 Safari/604.1';
+  const ANDROID_CHROME = 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Mobile Safari/537.36';
+
+  it('shows on the timer in Chromium browsers', () => {
+    expect(nativePromptNeedsGesture(CHROME)).toBe(false);
+    expect(nativePromptNeedsGesture(EDGE)).toBe(false);
+    expect(nativePromptNeedsGesture(ANDROID_CHROME)).toBe(false);
+    expect(nativePromptNeedsGesture('anything', true)).toBe(false);
+  });
+
+  it('waits for a click in Safari, Firefox, iOS and unknown browsers', () => {
+    expect(nativePromptNeedsGesture(SAFARI)).toBe(true);
+    expect(nativePromptNeedsGesture(FIREFOX)).toBe(true);
+    expect(nativePromptNeedsGesture(IOS_CHROME, true)).toBe(true);
+    expect(nativePromptNeedsGesture('')).toBe(true);
   });
 });

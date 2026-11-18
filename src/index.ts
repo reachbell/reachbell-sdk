@@ -314,6 +314,15 @@ export function safeBackground(input: unknown, fallback: string): string {
   return fallback;
 }
 
+export function nativePromptNeedsGesture(userAgent: string, hasUserAgentData = false): boolean {
+  const ua = userAgent || '';
+  if (/iPhone|iPad|iPod|FxiOS|CriOS|EdgiOS/.test(ua)) return true;
+  if (/Firefox\//.test(ua)) return true;
+  if (hasUserAgentData) return false;
+  if (/Chrome\/|Chromium\/|Edg\//.test(ua)) return false;
+  return true;
+}
+
 export function normalizeApiUrl(raw: string): string {
   return raw.trim().replace(/\/+$/, '');
 }
@@ -489,7 +498,11 @@ class ReachBellClient {
       if (!promptFrequencyAllows(this.readPromptHistory(), Date.now(), cfg)) return;
       void this.prompt();
     };
-    const trigger = cfg.type === 'native' ? () => this.armAutoPromptOnGesture(fire) : fire;
+    const needsGesture =
+      cfg.type === 'native' &&
+      (typeof navigator === 'undefined' ||
+        nativePromptNeedsGesture(navigator.userAgent, !!(navigator as { userAgentData?: unknown }).userAgentData));
+    const trigger = needsGesture ? () => this.armAutoPromptOnGesture(fire) : fire;
     this.afterPromptTriggers(cfg, trigger);
   }
 
