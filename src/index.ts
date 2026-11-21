@@ -36,6 +36,7 @@ export interface ReachBellConfig {
   swPath?:   string;
   autoPrompt?: boolean;
   debug?:    boolean;
+  showPoweredBy?: boolean;
   /** Force re-initialization (replaces config + re-runs bootstrap). */
   force?:    boolean;
 }
@@ -1950,7 +1951,7 @@ class ReachBellClient {
         declineBtn.textContent = cfg.declineText || DEFAULT_DECLINE;
         buttons.appendChild(declineBtn);
 
-        if ((cfg as any).showPoweredBy !== false) {
+        if (this.config?.showPoweredBy !== false && (cfg as any).showPoweredBy !== false) {
           const poweredBy = document.createElement('div');
           Object.assign(poweredBy.style, {
             marginTop: '10px', paddingTop: '8px', borderTop: '1px solid rgba(148, 163, 184, 0.15)',
