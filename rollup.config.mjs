@@ -1,4 +1,20 @@
 import typescript from '@rollup/plugin-typescript';
+import { copyFileSync } from 'node:fs';
+
+/**
+ * One declaration file per module condition. A single ESM-syntax index.d.ts
+ * shared by `import` and `require` makes TypeScript (node16/nodenext) treat
+ * the CJS entry as ESM-typed. The content is identical: the CJS bundle uses
+ * `exports: 'named'`, so `export default` maps to `require(...).default`,
+ * which is exactly what an ESM-syntax .d.cts describes.
+ */
+const perConditionTypes = () => ({
+  name: 'per-condition-types',
+  writeBundle: { sequential: true, order: 'post', handler() {
+    copyFileSync('dist/index.d.ts', 'dist/index.d.mts');
+    copyFileSync('dist/index.d.ts', 'dist/index.d.cts');
+  } },
+});
 
 /**
  * Three-format build:
@@ -35,5 +51,6 @@ export default {
       rootDir: 'src',
       sourceMap: true,
     }),
+    perConditionTypes(),
   ],
 };

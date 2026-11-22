@@ -35,8 +35,8 @@ if (sub.success) {
 | ----------------------------- | ----------------------------- | ---------------------------------------------------------------------------- |
 | `ReachBell.init(config)`      | `void`                        | Idempotent — second call is a no-op unless `force:true` is set.              |
 | `ReachBell.prompt()`          | `Promise<SubscribeResult>`    | Shows the configured opt-in prompt, then subscribes if accepted. Returns `permission_denied` straight away when the browser has blocked notifications, and re-uses an existing subscription when permission is already granted. |
-| `ReachBell.unsubscribe()`     | `Promise<ApiResult>`          | Removes this browser's push subscription and forgets the stored token.       |
-| `ReachBell.identify(extId)`   | `Promise<ApiResult>`          | Links the subscription to your user ID.                                      |
+| `ReachBell.unsubscribe()`     | `Promise<ApiResult>`          | Removes this browser's push subscription and forgets the stored token. The opt-out is remembered, so later page loads don't re-subscribe silently; only `prompt()` subscribes again. Returns `sw_not_registered` if no service worker registration can be found. |
+| `ReachBell.identify(extId, { hash }?)` | `Promise<ApiResult>` | Links the subscription to your user ID. Pass `null` on logout to unlink it. `hash` is the identity-verification HMAC for verified IDs (e.g. Shopify customers); it is stored and resent with that ID. |
 | `ReachBell.tag(tags)`         | `Promise<ApiResult>`          | Adds tags to the subscription for segmentation.                              |
 | `ReachBell.showToast(opts)`   | `() => void`                  | In-page toast (no push permission needed). Returns a dismiss fn.             |
 | `ReachBell.showBanner(opts)`  | `() => void`                  | Sticky top/bottom announcement bar. Returns a dismiss fn.                    |

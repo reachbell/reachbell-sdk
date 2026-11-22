@@ -52,6 +52,15 @@ export interface ApiResult {
   reason?: string;
 }
 
+export interface IdentifyOptions {
+  /**
+   * Identity-verification hash: hex HMAC-SHA256 of the externalId, keyed
+   * with the project's identity secret (computed server-side, e.g. by the
+   * Shopify theme embed). Sent as `identityHash` with this externalId.
+   */
+  hash?: string;
+}
+
 export type ToastPosition = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
 
 export interface ToastOptions {
@@ -267,6 +276,10 @@ export function urlBase64ToUint8Array(base64: string): Uint8Array<ArrayBuffer> {
 const DAY_MS = 86_400_000;
 const SESSION_SHOWS_KEY = 'reachbell_prompt_session_shows';
 const ENDPOINT_KEY = 'reachbell_endpoint';
+/** Set by unsubscribe(), cleared only by prompt(): stops silent re-subscribe. */
+const OPT_OUT_KEY = 'reachbell_opted_out';
+/** { externalId, hash? } from the last successful identify(). */
+const IDENTITY_KEY = 'reachbell_identity';
 const SW_ACTIVATE_TIMEOUT_MS = 10_000;
 
 export interface PromptHistory {
@@ -344,6 +357,11 @@ export function sameApplicationServerKey(current: ArrayBuffer | null | undefined
 
 /* ─── Client ──────────────────────────────────────────────────── */
 
+interface StoredIdentity {
+  externalId: string;
+  hash?: string;
+}
+
 class ReachBellClient {
   private config: ReachBellConfig | null = null;
   private promptConfig: PromptConfig | null = null;
@@ -356,6 +374,8 @@ class ReachBellClient {
   private swListenerInstalled = false;
   private warned = false;
   private token: string | null = null;
+  /** Set while a bell widget is mounted so it can reflect subscribe/unsubscribe. */
+  private onSubscriptionChange: (() => void) | null = null;
 
   init(config: ReachBellConfig): void {
     if (this.config && !config.force) {
@@ -425,8 +445,9 @@ class ReachBellClient {
     } catch (e) {
       this.log('Prompt setup failed', e);
     }
+    if (superseded()) return;
 
-    await this.syncSubscription();
+    await this.syncSubscription(superseded);
   }
 
   private async loadContext(): Promise<void> {
@@ -442,17 +463,22 @@ class ReachBellClient {
     if (widgetEnabled(banner)) {
       const title = banner.message || banner.title || banner.headline;
       if (title) {
+        const position: BannerPosition = banner.position === 'bottom' ? 'bottom' : 'top';
         this.showBanner({
           title,
           body:            banner.highlightText || banner.secondaryText || banner.body || '',
           ctaText:         banner.showCta !== false ? banner.ctaText || undefined : undefined,
           url:             banner.ctaUrl || banner.url,
-          position:        banner.position === 'bottom' ? 'bottom' : 'top',
+          position,
           backgroundColor: banner.backgroundColor,
           textColor:       banner.textColor,
           dismissible:     banner.dismissible !== false,
           duration:        banner.duration,
         });
+        // Grab this exact bar so reset() removes it without touching a
+        // banner the host page shows later at the same position.
+        const bar = document.getElementById(`reachbell-banner-${position}`);
+        if (bar) this.cleanups.layoutBanner = () => bar.remove();
       }
     }
 
@@ -463,6 +489,7 @@ class ReachBellClient {
         accentColor: notifCenter.accentColor,
         title:       notifCenter.title,
         maxItems:    notifCenter.maxItems,
+        emptyText:   notifCenter.emptyText,
       });
     }
 
@@ -471,8 +498,9 @@ class ReachBellClient {
       const title = toast.title || toast.message;
       if (title) {
         const delaySec = typeof toast.delaySeconds === 'number' ? toast.delaySeconds : 2;
+        let dismissToast: (() => void) | null = null;
         const timer = setTimeout(() => {
-          this.showToast({
+          dismissToast = this.showToast({
             title,
             body:        toast.title ? toast.message || toast.body : toast.body,
             url:         toast.actionUrl || toast.url,
@@ -482,7 +510,10 @@ class ReachBellClient {
             ctaText:     toast.showCtaButton !== false ? toast.ctaText || undefined : undefined,
           });
         }, Math.max(0, delaySec * 1000));
-        this.cleanups.layoutToast = () => clearTimeout(timer);
+        this.cleanups.layoutToast = () => {
+          clearTimeout(timer);
+          dismissToast?.();
+        };
       }
     }
   }
@@ -577,11 +608,12 @@ class ReachBellClient {
    * 10s), and links any caller-provided AbortSignal so cancellation from
    * either source aborts the fetch.
    */
-  private async request(
+  private async request<T>(
     path: string,
-    init: RequestInit = {},
+    init: RequestInit,
+    read: (res: Response) => Promise<T> | T,
     ms: number = DEFAULT_TIMEOUT_MS,
-  ): Promise<Response> {
+  ): Promise<T> {
     if (!this.config) throw new Error('Call ReachBell.init() first');
     const ctrl = new AbortController();
     const outerSignal = init.signal;
@@ -589,7 +621,7 @@ class ReachBellClient {
     outerSignal?.addEventListener('abort', onOuterAbort, { once: true });
     const timer = setTimeout(() => ctrl.abort(), ms);
     try {
-      return await fetch(`${this.config.apiUrl}${path}`, {
+      const res = await fetch(`${this.config.apiUrl}${path}`, {
         ...init,
         signal: ctrl.signal,
         headers: {
@@ -597,6 +629,9 @@ class ReachBellClient {
           ...(init.headers ?? {}),
         },
       });
+      // The timeout stays armed until `read` has consumed the body, so a
+      // server that stalls mid-body can't hang the caller.
+      return await read(res);
     } finally {
       clearTimeout(timer);
       outerSignal?.removeEventListener('abort', onOuterAbort);
@@ -604,9 +639,10 @@ class ReachBellClient {
   }
 
   private async fetchContext(): Promise<any> {
-    const res = await this.request('/projects/context');
-    if (!res.ok) throw new Error(`Failed to fetch ReachBell context (status ${res.status})`);
-    return res.json();
+    return this.request('/projects/context', {}, res => {
+      if (!res.ok) throw new Error(`Failed to fetch ReachBell context (status ${res.status})`);
+      return res.json();
+    });
   }
 
   private async registerServiceWorker(): Promise<void> {
@@ -668,13 +704,17 @@ class ReachBellClient {
     return reg.active ? reg : null;
   }
 
-  private async syncSubscription(): Promise<void> {
+  private async syncSubscription(superseded: () => boolean = () => false): Promise<void> {
     if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
     if (!this.swReg || !this.serverContext?.vapidKeys?.public) return;
+    // The visitor unsubscribed: permission stays granted, but we must not
+    // quietly subscribe them again on the next page load.
+    if (this.isOptedOut()) return;
     try {
       const reg = await this.activeRegistration();
-      if (!reg) return;
+      if (!reg || superseded()) return;
       const sub = await reg.pushManager.getSubscription();
+      if (superseded()) return;
       const stale = !sub
         || !sameApplicationServerKey(sub.options?.applicationServerKey, this.serverContext.vapidKeys.public)
         || !this.readToken()
@@ -721,7 +761,10 @@ class ReachBellClient {
       if (!this.swReg) return { success: false, reason: 'push_not_supported' };
     }
 
-    if (Notification.permission === 'granted') return this.subscribe();
+    if (Notification.permission === 'granted') {
+      this.setOptedOut(false);
+      return this.subscribe();
+    }
 
     const cfg = this.promptConfig;
     if (cfg?.enabled === true && cfg.type !== 'native' && !this.isBellWidget(cfg)) {
@@ -735,6 +778,7 @@ class ReachBellClient {
     const permission = await Notification.requestPermission();
     if (permission !== 'granted') return { success: false, reason: 'permission_denied' };
 
+    this.setOptedOut(false);
     return this.subscribe();
   }
 
@@ -760,23 +804,42 @@ class ReachBellClient {
     }
 
     try {
-      const res = await this.request('/subscribers', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          subscription: sub.toJSON(),
-          token:        JSON.stringify(sub),
-          tokenType:    'vapid',
-        }),
-      });
-      if (!res.ok) return { success: false, reason: `subscribe_failed_${res.status}` };
-      const data = await res.json();
-      const t: string | null = data.token ?? null;
-      this.storeToken(t, sub.endpoint);
-      return { success: true, token: t ?? undefined };
+      const identity = this.readIdentity();
+      let result = await this.registerSubscriber(sub, identity);
+      if (!result.success && identity && result.reason === 'identity_hash_invalid') {
+        // A stale hash (e.g. the shop re-linked and rotated its secret) must
+        // not block the push subscription itself — register without it.
+        this.storeIdentity(null);
+        result = await this.registerSubscriber(sub, null);
+      }
+      return result;
     } catch (e: any) {
       return { success: false, reason: e?.name === 'AbortError' ? 'timed_out' : 'network_error' };
     }
+  }
+
+  private registerSubscriber(sub: PushSubscription, identity: StoredIdentity | null): Promise<SubscribeResult> {
+    const body: Record<string, unknown> = {
+      subscription: sub.toJSON(),
+      token:        JSON.stringify(sub),
+      tokenType:    'vapid',
+    };
+    if (identity) {
+      body.externalId = identity.externalId;
+      if (identity.hash) body.identityHash = identity.hash;
+    }
+    return this.request('/subscribers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }, async (res): Promise<SubscribeResult> => {
+      if (!res.ok) return { success: false, reason: `subscribe_failed_${res.status}` };
+      const data = await res.json();
+      if (data?.success === false) return { success: false, reason: data.reason ?? 'subscribe_rejected' };
+      const t: string | null = data?.token ?? null;
+      this.storeToken(t, sub.endpoint);
+      return { success: true, token: t ?? undefined };
+    });
   }
 
   async unsubscribe(): Promise<ApiResult> {
@@ -787,9 +850,18 @@ class ReachBellClient {
     if (this.bootstrapping) {
       try { await this.bootstrapping; } catch { }
     }
+    // Record the opt-out first: even if the browser subscription can't be
+    // removed below, the next page load must not subscribe again.
+    this.setOptedOut(true);
     try {
-      const reg = this.swReg ?? null;
-      const sub = reg ? await reg.pushManager.getSubscription() : null;
+      let reg = this.swReg ?? null;
+      if (!reg && typeof navigator !== 'undefined' && navigator.serviceWorker?.getRegistration) {
+        // Bootstrap failed (context fetch, SW register) or was superseded —
+        // the worker from an earlier visit may still hold the subscription.
+        reg = (await navigator.serviceWorker.getRegistration(this.config.swPath || DEFAULT_SW_PATH)) ?? null;
+      }
+      if (!reg) return { ok: false, reason: 'sw_not_registered' };
+      const sub = await reg.pushManager.getSubscription();
       if (sub) await sub.unsubscribe();
       this.storeToken(null, null);
       return { ok: true };
@@ -811,17 +883,78 @@ class ReachBellClient {
       else localStorage.removeItem(`${ENDPOINT_KEY}:${this.config?.apiKey ?? ''}`);
       localStorage.removeItem(TOKEN_KEY);
     } catch { }
+    this.onSubscriptionChange?.();
+  }
+
+  private scopedKey(base: string): string {
+    return `${base}:${this.config?.apiKey ?? ''}`;
+  }
+
+  private isOptedOut(): boolean {
+    try { return localStorage.getItem(this.scopedKey(OPT_OUT_KEY)) === '1'; } catch { return false; }
+  }
+
+  private setOptedOut(optedOut: boolean): void {
+    try {
+      if (optedOut) localStorage.setItem(this.scopedKey(OPT_OUT_KEY), '1');
+      else localStorage.removeItem(this.scopedKey(OPT_OUT_KEY));
+    } catch { }
+  }
+
+  private readIdentity(): StoredIdentity | null {
+    try {
+      const parsed: unknown = JSON.parse(localStorage.getItem(this.scopedKey(IDENTITY_KEY)) ?? 'null');
+      if (!parsed || typeof parsed !== 'object') return null;
+      const { externalId, hash } = parsed as { externalId?: unknown; hash?: unknown };
+      if (typeof externalId !== 'string' || !externalId) return null;
+      return typeof hash === 'string' && hash ? { externalId, hash } : { externalId };
+    } catch {
+      return null;
+    }
+  }
+
+  private storeIdentity(identity: StoredIdentity | null): void {
+    try {
+      if (identity) localStorage.setItem(this.scopedKey(IDENTITY_KEY), JSON.stringify(identity));
+      else localStorage.removeItem(this.scopedKey(IDENTITY_KEY));
+    } catch { }
+  }
+
+  /** True when this browser holds an active ReachBell subscription for the project. */
+  private isSubscribed(): boolean {
+    return typeof Notification !== 'undefined'
+      && Notification.permission === 'granted'
+      && !!this.readToken()
+      && !this.isOptedOut();
   }
 
   private readEndpoint(): string | null {
     try { return localStorage.getItem(`${ENDPOINT_KEY}:${this.config?.apiKey ?? ''}`); } catch { return null; }
   }
 
-  async identify(externalId: string): Promise<ApiResult> {
+  /**
+   * Link this subscription to your user id, or pass `null` on logout to
+   * unlink it. `opts.hash` is the identity-verification HMAC required for
+   * verified ids (e.g. `shopify_customer_…`); it is stored with the id and
+   * resent whenever the SDK sends that id again.
+   */
+  async identify(externalId: string | null, opts: IdentifyOptions = {}): Promise<ApiResult> {
     if (!this.config) return { ok: false, reason: 'sdk_not_initialized' };
+    if (externalId !== null && (typeof externalId !== 'string' || !externalId)) {
+      return { ok: false, reason: 'external_id_required' };
+    }
     const token = this.readToken();
-    if (!token)       return { ok: false, reason: 'no_subscription' };
-    return this.postJson('/subscribers/identify', { token, externalId });
+    if (externalId === null) {
+      // Logging out: forget the id locally either way so it is never resent.
+      this.storeIdentity(null);
+      if (!token) return { ok: false, reason: 'no_subscription' };
+      return this.postJson('/subscribers/unidentify', { token });
+    }
+    if (!token) return { ok: false, reason: 'no_subscription' };
+    const hash = typeof opts?.hash === 'string' && opts.hash ? opts.hash : undefined;
+    const result = await this.postJson('/subscribers/identify', hash ? { token, externalId, identityHash: hash } : { token, externalId });
+    if (result.ok) this.storeIdentity(hash ? { externalId, hash } : { externalId });
+    return result;
   }
 
   async tag(tags: string[]): Promise<ApiResult> {
@@ -833,12 +966,17 @@ class ReachBellClient {
 
   private async postJson(path: string, body: unknown): Promise<ApiResult> {
     try {
-      const res = await this.request(path, {
+      return await this.request(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
+      }, async (res): Promise<ApiResult> => {
+        if (!res.ok) return { ok: false, reason: `server_${res.status}` };
+        // The API answers business-rule failures with 2xx + { success:false, reason }.
+        const data: any = await res.json().catch(() => null);
+        if (data && data.success === false) return { ok: false, reason: typeof data.reason === 'string' ? data.reason : 'rejected' };
+        return { ok: true };
       });
-      return res.ok ? { ok: true } : { ok: false, reason: `server_${res.status}` };
     } catch (e: any) {
       return { ok: false, reason: e?.name === 'AbortError' ? 'timed_out' : 'network_error' };
     }
@@ -1042,6 +1180,8 @@ class ReachBellClient {
       if (!target || !target.href) return;
       try {
         const u = new URL(target.href, window.location.href);
+        // Only web links: javascript:, mailto:, tel: etc. (origin "null") are left alone.
+        if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
         // Skip same-origin links — UTM is for outbound attribution only.
         if (u.origin === window.location.origin) return;
         if (!u.searchParams.has('utm_source'))   u.searchParams.set('utm_source',   utm.source);
@@ -1494,7 +1634,9 @@ class ReachBellClient {
     const accent = safeColor(cfg.accentColor || cfg.bellWidget?.color, DEFAULT_ACCENT);
     const sizeStr = cfg.bellSize || cfg.bellWidget?.size || 'medium';
     const sizePx = sizeStr === 'small' ? 40 : sizeStr === 'large' ? 56 : 48;
-    const tooltipText = cfg.bellTooltip || cfg.bellWidget?.tooltipText || 'Enable notifications';
+    const promptTooltip = cfg.bellTooltip || cfg.bellWidget?.tooltipText || 'Enable notifications';
+    const subscribedTooltip = cfg.bellSubscribedTooltip || cfg.bellWidget?.subscribedTooltipText || 'Notifications are on';
+    const tooltipText = this.isSubscribed() ? subscribedTooltip : promptTooltip;
     const pulse = cfg.bellPulse !== false && cfg.bellWidget?.pulseAnimation !== false;
 
     const container = document.createElement('div');
@@ -1554,8 +1696,9 @@ class ReachBellClient {
       height: `${sizePx}px`,
     });
 
+    let pulseRing: HTMLDivElement | null = null;
     if (pulse) {
-      const pulseRing = document.createElement('div');
+      pulseRing = document.createElement('div');
       Object.assign(pulseRing.style, {
         position: 'absolute', inset: '0', borderRadius: '9999px',
         background: accent, pointerEvents: 'none', opacity: '0',
@@ -1610,7 +1753,27 @@ class ReachBellClient {
     button.addEventListener('focus', () => showTooltip(true));
     button.addEventListener('blur', () => showTooltip(false));
 
+    // Reflect the live subscription state: already-subscribed visitors see
+    // "on" instead of an invitation, and no attention-grabbing pulse.
+    const applyState = () => {
+      const subscribed = this.isSubscribed();
+      const label = subscribed ? subscribedTooltip : promptTooltip;
+      button.setAttribute('aria-label', label);
+      if (tooltip) tooltip.textContent = label;
+      if (pulseRing) pulseRing.style.display = subscribed ? 'none' : '';
+    };
+    applyState();
+
     button.addEventListener('click', async () => {
+      if (this.isSubscribed()) {
+        this.showToast({
+          title: 'Notifications Active',
+          body: 'You are subscribed to receive updates from this site.',
+          duration: 3500,
+          accentColor: accent,
+        });
+        return;
+      }
       if (typeof Notification !== 'undefined' && Notification.permission === 'denied') {
         this.showToast({
           title: 'Notifications Blocked',
@@ -1635,8 +1798,10 @@ class ReachBellClient {
     container.appendChild(btnWrap);
     document.body.appendChild(container);
 
+    this.onSubscriptionChange = applyState;
     const cleanup = () => {
       container.remove();
+      if (this.onSubscriptionChange === applyState) this.onSubscriptionChange = null;
       if (this.cleanups.bellWidget === cleanup) delete this.cleanups.bellWidget;
     };
     this.cleanups.bellWidget = cleanup;
@@ -1688,6 +1853,7 @@ class ReachBellClient {
       document.getElementById('reachbell-custom-prompt')?.remove();
 
       const accent = safeColor(cfg.accentColor, DEFAULT_ACCENT);
+      const iconUrl = safeUrl(cfg.iconUrl);
       const pos = resolvePromptPlacement(cfg.position || cfg.softPrompt?.position);
       const isCenterModal = pos === 'center-modal';
       const isTopBar = pos === 'top-bar';
@@ -1790,9 +1956,9 @@ class ReachBellClient {
           minWidth: '0',
         });
 
-        if (cfg.iconUrl) {
+        if (iconUrl) {
           const img = document.createElement('img');
-          img.src = cfg.iconUrl;
+          img.src = iconUrl;
           img.alt = 'Logo';
           Object.assign(img.style, {
             width: '32px', height: '32px', borderRadius: '8px', objectFit: 'contain',
@@ -1870,9 +2036,9 @@ class ReachBellClient {
         Object.assign(row.style, { display: 'flex', gap: '12px', alignItems: 'flex-start' });
         card.appendChild(row);
 
-        if (cfg.iconUrl) {
+        if (iconUrl) {
           const img = document.createElement('img');
-          img.src = cfg.iconUrl;
+          img.src = iconUrl;
           img.alt = 'Brand Logo';
           Object.assign(img.style, {
             width: '40px',

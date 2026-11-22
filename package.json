@@ -1,15 +1,20 @@
 {
   "name": "@reachbell/sdk",
-  "version": "1.0.13",
+  "version": "1.1.0",
   "description": "ReachBell official browser SDK — push notifications, email subscriptions, and user identification.",
   "main": "dist/index.cjs",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.mjs",
-      "require": "./dist/index.cjs",
+      "import": {
+        "types": "./dist/index.d.mts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      },
       "default": "./dist/index.mjs"
     },
     "./package.json": "./package.json",
@@ -33,7 +38,7 @@
     "build": "rollup -c",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
     "prepublishOnly": "npm run typecheck && npm run test && npm run build"
   },
   "keywords": [
