@@ -45,11 +45,27 @@ export interface SubscribeResult {
   success: boolean;
   token?:  string;
   reason?: string;
+  /**
+   * Set on a successful subscribe when the stored externalId was dropped
+   * because the API rejected its identity hash (`identity_hash_invalid`,
+   * e.g. after the identity secret rotated). The subscription is active but
+   * anonymous — call identify() again with a fresh hash to link the user.
+   */
+  identityDropped?: true;
 }
 
 export interface ApiResult {
   ok: boolean;
   reason?: string;
+}
+
+export interface IdentifyOptions {
+  /**
+   * Identity-verification hash: hex HMAC-SHA256 of the externalId, keyed
+   * with the project's identity secret (computed server-side, e.g. by the
+   * Shopify theme embed). Sent as `identityHash` with this externalId.
+   */
+  hash?: string;
 }
 
 export type ToastPosition = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
@@ -267,6 +283,10 @@ export function urlBase64ToUint8Array(base64: string): Uint8Array<ArrayBuffer> {
 const DAY_MS = 86_400_000;
 const SESSION_SHOWS_KEY = 'reachbell_prompt_session_shows';
 const ENDPOINT_KEY = 'reachbell_endpoint';
+/** Set by unsubscribe(), cleared only by prompt(): stops silent re-subscribe. */
+const OPT_OUT_KEY = 'reachbell_opted_out';
+/** { externalId, hash? } from the latest identify() (newest user wins). */
+const IDENTITY_KEY = 'reachbell_identity';
 const SW_ACTIVATE_TIMEOUT_MS = 10_000;
 
 export interface PromptHistory {
@@ -344,6 +364,11 @@ export function sameApplicationServerKey(current: ArrayBuffer | null | undefined
 
 /* ─── Client ──────────────────────────────────────────────────── */
 
+interface StoredIdentity {
+  externalId: string;
+  hash?: string;
+}
+
 class ReachBellClient {
   private config: ReachBellConfig | null = null;
   private promptConfig: PromptConfig | null = null;
@@ -356,6 +381,14 @@ class ReachBellClient {
   private swListenerInstalled = false;
   private warned = false;
   private token: string | null = null;
+  /** Set while a bell widget is mounted so it can reflect subscribe/unsubscribe. */
+  private onSubscriptionChange: (() => void) | null = null;
+  /**
+   * In-memory mirror of the opt-out flag (keyed like the storage entry) so
+   * unsubscribe() still sticks for this page session when localStorage is
+   * unavailable (Safari private mode, blocked storage).
+   */
+  private optedOutMemory = new Set<string>();
 
   init(config: ReachBellConfig): void {
     if (this.config && !config.force) {
@@ -375,6 +408,10 @@ class ReachBellClient {
     this.log('Initialized', this.config);
     this.bootstrapping = this.bootstrap();
     void this.bootstrapping;
+    // Lets framework bindings notice a (force) re-init and re-await `ready`.
+    try {
+      if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('reachbell:init'));
+    } catch { /* CustomEvent unsupported — best-effort */ }
   }
 
   /** Resolves once the boot chain (context + SW registration) has settled. */
@@ -395,12 +432,17 @@ class ReachBellClient {
 
   private async bootstrap(): Promise<void> {
     if (typeof window === 'undefined') return;
+    // A force re-init swaps this.config; an older bootstrap still in flight
+    // must stop instead of mounting widgets or prompts for the old project.
+    const config = this.config;
+    const superseded = () => this.config !== config;
     try {
       await this.loadContext();
     } catch (e) {
-      this.warnOnce('Could not load ReachBell settings — push notifications will not work on this page', e);
+      if (!superseded()) this.warnOnce('Could not load ReachBell settings — push notifications will not work on this page', e);
       return;
     }
+    if (superseded()) return;
 
     try {
       this.mountLayouts(this.serverContext?.customLayouts ?? {});
@@ -413,18 +455,22 @@ class ReachBellClient {
     } catch (e) {
       this.warnOnce('Service worker registration failed — push notifications will not work on this page', e);
     }
+    if (superseded()) return;
 
     try {
       this.armPromptUi();
     } catch (e) {
       this.log('Prompt setup failed', e);
     }
+    if (superseded()) return;
 
-    await this.syncSubscription();
+    await this.syncSubscription(superseded);
   }
 
   private async loadContext(): Promise<void> {
+    const config = this.config;
     const ctx = await this.fetchContext();
+    if (this.config !== config) return;
     this.serverContext = ctx;
     this.promptConfig = ctx?.promptConfig ?? null;
   }
@@ -434,17 +480,22 @@ class ReachBellClient {
     if (widgetEnabled(banner)) {
       const title = banner.message || banner.title || banner.headline;
       if (title) {
+        const position: BannerPosition = banner.position === 'bottom' ? 'bottom' : 'top';
         this.showBanner({
           title,
           body:            banner.highlightText || banner.secondaryText || banner.body || '',
           ctaText:         banner.showCta !== false ? banner.ctaText || undefined : undefined,
           url:             banner.ctaUrl || banner.url,
-          position:        banner.position === 'bottom' ? 'bottom' : 'top',
+          position,
           backgroundColor: banner.backgroundColor,
           textColor:       banner.textColor,
           dismissible:     banner.dismissible !== false,
           duration:        banner.duration,
         });
+        // Grab this exact bar so reset() removes it without touching a
+        // banner the host page shows later at the same position.
+        const bar = document.getElementById(`reachbell-banner-${position}`);
+        if (bar) this.cleanups.layoutBanner = () => bar.remove();
       }
     }
 
@@ -455,6 +506,7 @@ class ReachBellClient {
         accentColor: notifCenter.accentColor,
         title:       notifCenter.title,
         maxItems:    notifCenter.maxItems,
+        emptyText:   notifCenter.emptyText,
       });
     }
 
@@ -463,8 +515,9 @@ class ReachBellClient {
       const title = toast.title || toast.message;
       if (title) {
         const delaySec = typeof toast.delaySeconds === 'number' ? toast.delaySeconds : 2;
+        let dismissToast: (() => void) | null = null;
         const timer = setTimeout(() => {
-          this.showToast({
+          dismissToast = this.showToast({
             title,
             body:        toast.title ? toast.message || toast.body : toast.body,
             url:         toast.actionUrl || toast.url,
@@ -474,7 +527,10 @@ class ReachBellClient {
             ctaText:     toast.showCtaButton !== false ? toast.ctaText || undefined : undefined,
           });
         }, Math.max(0, delaySec * 1000));
-        this.cleanups.layoutToast = () => clearTimeout(timer);
+        this.cleanups.layoutToast = () => {
+          clearTimeout(timer);
+          dismissToast?.();
+        };
       }
     }
   }
@@ -569,11 +625,12 @@ class ReachBellClient {
    * 10s), and links any caller-provided AbortSignal so cancellation from
    * either source aborts the fetch.
    */
-  private async request(
+  private async request<T>(
     path: string,
-    init: RequestInit = {},
+    init: RequestInit,
+    read: (res: Response) => Promise<T> | T,
     ms: number = DEFAULT_TIMEOUT_MS,
-  ): Promise<Response> {
+  ): Promise<T> {
     if (!this.config) throw new Error('Call ReachBell.init() first');
     const ctrl = new AbortController();
     const outerSignal = init.signal;
@@ -581,7 +638,7 @@ class ReachBellClient {
     outerSignal?.addEventListener('abort', onOuterAbort, { once: true });
     const timer = setTimeout(() => ctrl.abort(), ms);
     try {
-      return await fetch(`${this.config.apiUrl}${path}`, {
+      const res = await fetch(`${this.config.apiUrl}${path}`, {
         ...init,
         signal: ctrl.signal,
         headers: {
@@ -589,6 +646,9 @@ class ReachBellClient {
           ...(init.headers ?? {}),
         },
       });
+      // The timeout stays armed until `read` has consumed the body, so a
+      // server that stalls mid-body can't hang the caller.
+      return await read(res);
     } finally {
       clearTimeout(timer);
       outerSignal?.removeEventListener('abort', onOuterAbort);
@@ -596,9 +656,10 @@ class ReachBellClient {
   }
 
   private async fetchContext(): Promise<any> {
-    const res = await this.request('/projects/context');
-    if (!res.ok) throw new Error(`Failed to fetch ReachBell context (status ${res.status})`);
-    return res.json();
+    return this.request('/projects/context', {}, res => {
+      if (!res.ok) throw new Error(`Failed to fetch ReachBell context (status ${res.status})`);
+      return res.json();
+    });
   }
 
   private async registerServiceWorker(): Promise<void> {
@@ -606,7 +667,9 @@ class ReachBellClient {
       this.log('Service workers not supported');
       return;
     }
-    const reg = await navigator.serviceWorker.register(this.config!.swPath!);
+    const config = this.config;
+    const reg = await navigator.serviceWorker.register(config!.swPath!);
+    if (this.config !== config) return;
     this.swReg = reg;
     this.log('SW registered', reg);
     this.sendWorkerConfig(reg.active ?? reg.waiting ?? reg.installing);
@@ -658,19 +721,23 @@ class ReachBellClient {
     return reg.active ? reg : null;
   }
 
-  private async syncSubscription(): Promise<void> {
+  private async syncSubscription(superseded: () => boolean = this.supersededCheck()): Promise<void> {
     if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
     if (!this.swReg || !this.serverContext?.vapidKeys?.public) return;
+    // The visitor unsubscribed: permission stays granted, but we must not
+    // quietly subscribe them again on the next page load.
+    if (this.isOptedOut()) return;
     try {
       const reg = await this.activeRegistration();
-      if (!reg) return;
+      if (!reg || superseded()) return;
       const sub = await reg.pushManager.getSubscription();
+      if (superseded()) return;
       const stale = !sub
         || !sameApplicationServerKey(sub.options?.applicationServerKey, this.serverContext.vapidKeys.public)
         || !this.readToken()
         || this.readEndpoint() !== sub.endpoint;
       if (!stale) return;
-      const result = await this.subscribe();
+      const result = await this.subscribe(superseded);
       if (!result.success) this.log('Subscription sync failed', result.reason);
     } catch (e) {
       this.log('Subscription sync failed', e);
@@ -711,7 +778,10 @@ class ReachBellClient {
       if (!this.swReg) return { success: false, reason: 'push_not_supported' };
     }
 
-    if (Notification.permission === 'granted') return this.subscribe();
+    if (Notification.permission === 'granted') {
+      this.setOptedOut(false);
+      return this.subscribe();
+    }
 
     const cfg = this.promptConfig;
     if (cfg?.enabled === true && cfg.type !== 'native' && !this.isBellWidget(cfg)) {
@@ -725,13 +795,21 @@ class ReachBellClient {
     const permission = await Notification.requestPermission();
     if (permission !== 'granted') return { success: false, reason: 'permission_denied' };
 
+    this.setOptedOut(false);
     return this.subscribe();
   }
 
-  private async subscribe(): Promise<SubscribeResult> {
+  /** A check that turns true once a (force) re-init replaces the current config. */
+  private supersededCheck(): () => boolean {
+    const config = this.config;
+    return () => this.config !== config;
+  }
+
+  private async subscribe(superseded: () => boolean = this.supersededCheck()): Promise<SubscribeResult> {
     const publicKey: string | undefined = this.serverContext?.vapidKeys?.public;
     if (!this.swReg || !publicKey) return { success: false, reason: 'not_ready' };
     const reg = await this.activeRegistration();
+    if (superseded()) return { success: false, reason: 'superseded' };
     if (!reg) return { success: false, reason: 'sw_not_active' };
 
     let sub: PushSubscription;
@@ -748,36 +826,97 @@ class ReachBellClient {
     } catch (e: any) {
       return { success: false, reason: `push_subscribe_failed_${e?.name ?? 'unknown'}` };
     }
+    // A force re-init (other project/API key) landed while the browser was
+    // subscribing: don't register this subscription or store its token
+    // under the new project.
+    if (superseded()) return { success: false, reason: 'superseded' };
 
     try {
-      const res = await this.request('/subscribers', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          subscription: sub.toJSON(),
-          token:        JSON.stringify(sub),
-          tokenType:    'vapid',
-        }),
-      });
-      if (!res.ok) return { success: false, reason: `subscribe_failed_${res.status}` };
-      const data = await res.json();
-      const t: string | null = data.token ?? null;
-      this.storeToken(t, sub.endpoint);
-      return { success: true, token: t ?? undefined };
+      const identity = this.readIdentity();
+      let result = await this.registerSubscriber(sub, identity, superseded);
+      if (!result.success && identity && result.reason === 'identity_hash_invalid' && !superseded()) {
+        // A stale hash (e.g. the shop re-linked and rotated its secret) must
+        // not block the push subscription itself — register without it.
+        this.storeIdentity(null);
+        result = await this.registerSubscriber(sub, null, superseded);
+        if (result.success) {
+          result = { ...result, identityDropped: true };
+          this.log(`Identity hash for "${identity.externalId}" was rejected (identity_hash_invalid) — subscribed without an externalId. Call identify() again with a fresh hash.`);
+          if (this.config?.debug) {
+            // eslint-disable-next-line no-console
+            console.warn('[ReachBell] Stored identity dropped: its identity hash was rejected (identity_hash_invalid).');
+          }
+        }
+      }
+      return result;
     } catch (e: any) {
       return { success: false, reason: e?.name === 'AbortError' ? 'timed_out' : 'network_error' };
     }
   }
 
+  private registerSubscriber(
+    sub: PushSubscription,
+    identity: StoredIdentity | null,
+    superseded: () => boolean = this.supersededCheck(),
+  ): Promise<SubscribeResult> {
+    const body: Record<string, unknown> = {
+      subscription: sub.toJSON(),
+      token:        JSON.stringify(sub),
+      tokenType:    'vapid',
+    };
+    if (identity) {
+      body.externalId = identity.externalId;
+      if (identity.hash) body.identityHash = identity.hash;
+    }
+    return this.request('/subscribers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }, async (res): Promise<SubscribeResult> => {
+      if (!res.ok) return { success: false, reason: `subscribe_failed_${res.status}` };
+      const data = await res.json();
+      if (data?.success === false) return { success: false, reason: data.reason ?? 'subscribe_rejected' };
+      // Re-initialised for another project while the request was in flight.
+      if (superseded()) return { success: false, reason: 'superseded' };
+      const t: string | null = data?.token ?? null;
+      this.storeToken(t, sub.endpoint);
+      return { success: true, token: t ?? undefined };
+    });
+  }
+
   async unsubscribe(): Promise<ApiResult> {
     if (!this.config) return { ok: false, reason: 'sdk_not_initialized' };
+    // swReg is only set once bootstrap has registered the worker; without
+    // this wait an early call would report ok:true and leave the push
+    // subscription in place.
+    if (this.bootstrapping) {
+      try { await this.bootstrapping; } catch { }
+    }
+    // Record the opt-out first: even if the browser subscription can't be
+    // removed below, the next page load must not subscribe again. The
+    // stored identity goes too, so a later subscribe is anonymous until the
+    // app calls identify() again.
+    this.setOptedOut(true);
+    this.storeIdentity(null);
     try {
-      const reg = this.swReg ?? null;
-      const sub = reg ? await reg.pushManager.getSubscription() : null;
+      let reg = this.swReg ?? null;
+      if (!reg && typeof navigator !== 'undefined' && navigator.serviceWorker?.getRegistration) {
+        // Bootstrap failed (context fetch, SW register) or was superseded —
+        // the worker from an earlier visit may still hold the subscription.
+        reg = (await navigator.serviceWorker.getRegistration(this.config.swPath || DEFAULT_SW_PATH)) ?? null;
+      }
+      if (!reg) {
+        // The opt-out above still changed the subscribed state — let a
+        // mounted bell widget reflect it.
+        this.onSubscriptionChange?.();
+        return { ok: false, reason: 'sw_not_registered' };
+      }
+      const sub = await reg.pushManager.getSubscription();
       if (sub) await sub.unsubscribe();
       this.storeToken(null, null);
       return { ok: true };
     } catch (e: any) {
+      this.onSubscriptionChange?.();
       return { ok: false, reason: `unsubscribe_failed_${e?.name ?? 'unknown'}` };
     }
   }
@@ -795,17 +934,101 @@ class ReachBellClient {
       else localStorage.removeItem(`${ENDPOINT_KEY}:${this.config?.apiKey ?? ''}`);
       localStorage.removeItem(TOKEN_KEY);
     } catch { }
+    this.onSubscriptionChange?.();
+  }
+
+  private scopedKey(base: string): string {
+    return `${base}:${this.config?.apiKey ?? ''}`;
+  }
+
+  private isOptedOut(): boolean {
+    const key = this.scopedKey(OPT_OUT_KEY);
+    if (this.optedOutMemory.has(key)) return true;
+    try { return localStorage.getItem(key) === '1'; } catch { return false; }
+  }
+
+  private setOptedOut(optedOut: boolean): void {
+    const key = this.scopedKey(OPT_OUT_KEY);
+    if (optedOut) this.optedOutMemory.add(key);
+    else this.optedOutMemory.delete(key);
+    try {
+      if (optedOut) localStorage.setItem(this.scopedKey(OPT_OUT_KEY), '1');
+      else localStorage.removeItem(this.scopedKey(OPT_OUT_KEY));
+    } catch { }
+  }
+
+  private readIdentity(): StoredIdentity | null {
+    try {
+      const parsed: unknown = JSON.parse(localStorage.getItem(this.scopedKey(IDENTITY_KEY)) ?? 'null');
+      if (!parsed || typeof parsed !== 'object') return null;
+      const { externalId, hash } = parsed as { externalId?: unknown; hash?: unknown };
+      if (typeof externalId !== 'string' || !externalId) return null;
+      return typeof hash === 'string' && hash ? { externalId, hash } : { externalId };
+    } catch {
+      return null;
+    }
+  }
+
+  private storeIdentity(identity: StoredIdentity | null): void {
+    try {
+      if (identity) localStorage.setItem(this.scopedKey(IDENTITY_KEY), JSON.stringify(identity));
+      else localStorage.removeItem(this.scopedKey(IDENTITY_KEY));
+    } catch { }
+  }
+
+  /** True when this browser holds an active ReachBell subscription for the project. */
+  private isSubscribed(): boolean {
+    return typeof Notification !== 'undefined'
+      && Notification.permission === 'granted'
+      && !!this.readToken()
+      && !this.isOptedOut();
   }
 
   private readEndpoint(): string | null {
     try { return localStorage.getItem(`${ENDPOINT_KEY}:${this.config?.apiKey ?? ''}`); } catch { return null; }
   }
 
-  async identify(externalId: string): Promise<ApiResult> {
+  /**
+   * Link this subscription to your user id, or pass `null` on logout to
+   * unlink it. `opts.hash` is the identity-verification HMAC required for
+   * verified ids (e.g. `shopify_customer_…`); it is stored with the id and
+   * resent whenever the SDK sends that id again.
+   *
+   * The newest call wins: the id (and hash) replaces any previously stored
+   * identity, including when there is no subscription yet — that call
+   * returns `{ ok:false, reason:'no_subscription' }` but the id is
+   * remembered and sent with the next subscribe. A network/server failure
+   * keeps the new id stored (it is resent, and verified, on the next
+   * POST /subscribers); `identity_hash_invalid` clears the stored identity.
+   *
+   * `identify(null)` always forgets the stored id locally; if the
+   * /subscribers/unidentify call fails it returns `{ ok:false, reason }`
+   * and the server-side link stays until identify(null) succeeds.
+   */
+  async identify(externalId: string | null, opts: IdentifyOptions = {}): Promise<ApiResult> {
     if (!this.config) return { ok: false, reason: 'sdk_not_initialized' };
+    if (externalId !== null && (typeof externalId !== 'string' || !externalId)) {
+      return { ok: false, reason: 'external_id_required' };
+    }
     const token = this.readToken();
-    if (!token)       return { ok: false, reason: 'no_subscription' };
-    return this.postJson('/subscribers/identify', { token, externalId });
+    if (externalId === null) {
+      // Logging out: forget the id locally either way so it is never resent.
+      this.storeIdentity(null);
+      if (!token) return { ok: false, reason: 'no_subscription' };
+      return this.postJson('/subscribers/unidentify', { token });
+    }
+    const hash = typeof opts?.hash === 'string' && opts.hash ? opts.hash : undefined;
+    const identity: StoredIdentity = hash ? { externalId, hash } : { externalId };
+    if (!token) {
+      // Remember it so the next subscribe sends this user, never an older one.
+      this.storeIdentity(identity);
+      return { ok: false, reason: 'no_subscription' };
+    }
+    const result = await this.postJson('/subscribers/identify', hash ? { token, externalId, identityHash: hash } : { token, externalId });
+    // Never keep the previous user's id: a rejected hash clears it, any other
+    // outcome stores this one (resent and verified on the next POST /subscribers).
+    this.storeIdentity(!result.ok && result.reason === 'identity_hash_invalid' ? null : identity);
+    return result;
   }
 
   async tag(tags: string[]): Promise<ApiResult> {
@@ -817,12 +1040,17 @@ class ReachBellClient {
 
   private async postJson(path: string, body: unknown): Promise<ApiResult> {
     try {
-      const res = await this.request(path, {
+      return await this.request(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
+      }, async (res): Promise<ApiResult> => {
+        if (!res.ok) return { ok: false, reason: `server_${res.status}` };
+        // The API answers business-rule failures with 2xx + { success:false, reason }.
+        const data: any = await res.json().catch(() => null);
+        if (data && data.success === false) return { ok: false, reason: typeof data.reason === 'string' ? data.reason : 'rejected' };
+        return { ok: true };
       });
-      return res.ok ? { ok: true } : { ok: false, reason: `server_${res.status}` };
     } catch (e: any) {
       return { ok: false, reason: e?.name === 'AbortError' ? 'timed_out' : 'network_error' };
     }
@@ -1026,6 +1254,8 @@ class ReachBellClient {
       if (!target || !target.href) return;
       try {
         const u = new URL(target.href, window.location.href);
+        // Only web links: javascript:, mailto:, tel: etc. (origin "null") are left alone.
+        if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
         // Skip same-origin links — UTM is for outbound attribution only.
         if (u.origin === window.location.origin) return;
         if (!u.searchParams.has('utm_source'))   u.searchParams.set('utm_source',   utm.source);
@@ -1478,7 +1708,9 @@ class ReachBellClient {
     const accent = safeColor(cfg.accentColor || cfg.bellWidget?.color, DEFAULT_ACCENT);
     const sizeStr = cfg.bellSize || cfg.bellWidget?.size || 'medium';
     const sizePx = sizeStr === 'small' ? 40 : sizeStr === 'large' ? 56 : 48;
-    const tooltipText = cfg.bellTooltip || cfg.bellWidget?.tooltipText || 'Enable notifications';
+    const promptTooltip = cfg.bellTooltip || cfg.bellWidget?.tooltipText || 'Enable notifications';
+    const subscribedTooltip = cfg.bellSubscribedTooltip || cfg.bellWidget?.subscribedTooltipText || 'Notifications are on';
+    const tooltipText = this.isSubscribed() ? subscribedTooltip : promptTooltip;
     const pulse = cfg.bellPulse !== false && cfg.bellWidget?.pulseAnimation !== false;
 
     const container = document.createElement('div');
@@ -1538,8 +1770,9 @@ class ReachBellClient {
       height: `${sizePx}px`,
     });
 
+    let pulseRing: HTMLDivElement | null = null;
     if (pulse) {
-      const pulseRing = document.createElement('div');
+      pulseRing = document.createElement('div');
       Object.assign(pulseRing.style, {
         position: 'absolute', inset: '0', borderRadius: '9999px',
         background: accent, pointerEvents: 'none', opacity: '0',
@@ -1594,7 +1827,27 @@ class ReachBellClient {
     button.addEventListener('focus', () => showTooltip(true));
     button.addEventListener('blur', () => showTooltip(false));
 
+    // Reflect the live subscription state: already-subscribed visitors see
+    // "on" instead of an invitation, and no attention-grabbing pulse.
+    const applyState = () => {
+      const subscribed = this.isSubscribed();
+      const label = subscribed ? subscribedTooltip : promptTooltip;
+      button.setAttribute('aria-label', label);
+      if (tooltip) tooltip.textContent = label;
+      if (pulseRing) pulseRing.style.display = subscribed ? 'none' : '';
+    };
+    applyState();
+
     button.addEventListener('click', async () => {
+      if (this.isSubscribed()) {
+        this.showToast({
+          title: 'Notifications Active',
+          body: 'You are subscribed to receive updates from this site.',
+          duration: 3500,
+          accentColor: accent,
+        });
+        return;
+      }
       if (typeof Notification !== 'undefined' && Notification.permission === 'denied') {
         this.showToast({
           title: 'Notifications Blocked',
@@ -1619,8 +1872,10 @@ class ReachBellClient {
     container.appendChild(btnWrap);
     document.body.appendChild(container);
 
+    this.onSubscriptionChange = applyState;
     const cleanup = () => {
       container.remove();
+      if (this.onSubscriptionChange === applyState) this.onSubscriptionChange = null;
       if (this.cleanups.bellWidget === cleanup) delete this.cleanups.bellWidget;
     };
     this.cleanups.bellWidget = cleanup;
@@ -1672,6 +1927,7 @@ class ReachBellClient {
       document.getElementById('reachbell-custom-prompt')?.remove();
 
       const accent = safeColor(cfg.accentColor, DEFAULT_ACCENT);
+      const iconUrl = safeUrl(cfg.iconUrl);
       const pos = resolvePromptPlacement(cfg.position || cfg.softPrompt?.position);
       const isCenterModal = pos === 'center-modal';
       const isTopBar = pos === 'top-bar';
@@ -1774,9 +2030,9 @@ class ReachBellClient {
           minWidth: '0',
         });
 
-        if (cfg.iconUrl) {
+        if (iconUrl) {
           const img = document.createElement('img');
-          img.src = cfg.iconUrl;
+          img.src = iconUrl;
           img.alt = 'Logo';
           Object.assign(img.style, {
             width: '32px', height: '32px', borderRadius: '8px', objectFit: 'contain',
@@ -1854,9 +2110,9 @@ class ReachBellClient {
         Object.assign(row.style, { display: 'flex', gap: '12px', alignItems: 'flex-start' });
         card.appendChild(row);
 
-        if (cfg.iconUrl) {
+        if (iconUrl) {
           const img = document.createElement('img');
-          img.src = cfg.iconUrl;
+          img.src = iconUrl;
           img.alt = 'Brand Logo';
           Object.assign(img.style, {
             width: '40px',
