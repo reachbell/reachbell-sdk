@@ -103,8 +103,12 @@ describe('ReachBell.init idempotency', () => {
       }),
     );
     ReachBell.init({ apiKey: 'k1', apiUrl: 'https://x.test' });
+    const onInit = vi.fn();
+    window.addEventListener('reachbell:init', onInit);
     ReachBell.init({ apiKey: 'k2', apiUrl: 'https://y.test', force: true });
+    window.removeEventListener('reachbell:init', onInit);
     expect((ReachBell as any).config.apiKey).toBe('k2');
+    expect(onInit).toHaveBeenCalledOnce();
     fetchSpy.mockRestore();
   });
 });

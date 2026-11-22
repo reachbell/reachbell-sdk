@@ -395,6 +395,10 @@ class ReachBellClient {
     this.log('Initialized', this.config);
     this.bootstrapping = this.bootstrap();
     void this.bootstrapping;
+    // Lets framework bindings notice a (force) re-init and re-await `ready`.
+    try {
+      if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('reachbell:init'));
+    } catch { /* CustomEvent unsupported — best-effort */ }
   }
 
   /** Resolves once the boot chain (context + SW registration) has settled. */

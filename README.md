@@ -33,7 +33,7 @@ if (sub.success) {
 
 | Method                        | Returns                       | Notes                                                                        |
 | ----------------------------- | ----------------------------- | ---------------------------------------------------------------------------- |
-| `ReachBell.init(config)`      | `void`                        | Idempotent — second call is a no-op unless `force:true` is set.              |
+| `ReachBell.init(config)`      | `void`                        | Idempotent — second call is a no-op unless `force:true` is set. Each (re)init dispatches a `reachbell:init` event on `window`. |
 | `ReachBell.prompt()`          | `Promise<SubscribeResult>`    | Shows the configured opt-in prompt, then subscribes if accepted. Returns `permission_denied` straight away when the browser has blocked notifications, and re-uses an existing subscription when permission is already granted. |
 | `ReachBell.unsubscribe()`     | `Promise<ApiResult>`          | Removes this browser's push subscription and forgets the stored token. The opt-out is remembered, so later page loads don't re-subscribe silently; only `prompt()` subscribes again. Returns `sw_not_registered` if no service worker registration can be found. |
 | `ReachBell.identify(extId, { hash }?)` | `Promise<ApiResult>` | Links the subscription to your user ID. Pass `null` on logout to unlink it. `hash` is the identity-verification HMAC for verified IDs (e.g. Shopify customers); it is stored and resent with that ID. |
