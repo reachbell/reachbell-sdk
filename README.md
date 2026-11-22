@@ -47,22 +47,31 @@ if (sub.success) {
 
 With `autoPrompt: true` the SDK shows the dashboard prompt on its own, using the dashboard's delay, scroll depth and frequency settings. A `native` prompt waits for the visitor's first click or key press, because browsers ignore permission requests that are not triggered by the visitor. Banner, toast and notification-center widgets appear only when they are switched on in the dashboard.
 
-`SubscribeResult = { success: boolean; token?: string; reason?: string; identityDropped?: true }`. Reasons: `sdk_not_initialized`, `push_not_supported`, `not_ready`, `permission_denied`, `user_declined_soft_prompt`, `sw_not_active`, `sw_register_failed_<name>`, `push_subscribe_failed_<name>`, `subscribe_failed_<status>`, `subscribe_rejected` (the API answered `success:false` without a reason), `identity_hash_invalid` (the stored ID's hash was rejected and the retry without it also failed), `superseded` (a `force` re-init replaced the config mid-subscribe; nothing was registered), `timed_out`, `network_error`.
+`SubscribeResult = { success: boolean; token?: string; reason?: string; identityDropped?: true }`. Reasons: `sdk_not_initialized`, `push_not_supported`, `not_ready`, `permission_denied`, `user_declined_soft_prompt`, `sw_not_active`, `sw_register_failed_<name>`, `push_subscribe_failed_<name>`, `subscribe_failed_<status>`, `subscribe_rejected` (the API answered `success:false` without a reason), `identity_hash_invalid` (rare: the stored ID's hash was rejected and a `force` re-init landed before the anonymous retry — normally a rejected hash is dropped and the subscribe is retried without it, see `identityDropped`; if that retry fails, its own reason is returned), `superseded` (a `force` re-init replaced the config mid-subscribe; no token was stored locally, but if `POST /subscribers` had already reached the API a server-side subscriber row may exist), `timed_out`, `network_error`.
 
 `identityDropped: true` is set on a **successful** subscribe when the stored user ID was rejected with `identity_hash_invalid` (e.g. the identity secret was rotated): the subscription is active but anonymous, and the stored ID was cleared. Call `identify()` again with a fresh hash. With `debug: true` the SDK also logs a `console.warn`.
+
+Background re-subscribes (on page load) and the unconfirmed-identity retry don't return a result to your code, so whenever the SDK drops a stored identity it also dispatches a `reachbell:identity-dropped` event on `window` with `detail: { externalId }` (exported as `IDENTITY_DROPPED_EVENT`):
+
+```js
+window.addEventListener('reachbell:identity-dropped', (e) => {
+  // e.detail.externalId lost its link — fetch a fresh hash and identify() again
+});
+```
 
 `ApiResult = { ok: boolean; reason?: string }`. Reasons: `sdk_not_initialized`, `no_subscription`, `external_id_required`, `identity_hash_invalid`, `subscriber_not_found`, `token_required`, `rejected` (the API answered `success:false` without a reason), `sw_not_registered`, `unsubscribe_failed_<name>`, `timed_out`, `network_error`, `server_<status>`. API-side reasons are passed through as-is.
 
 ### Identity
 
 - The newest `identify()` call wins. Its ID (and `hash`) replaces any stored one — including when there is no subscription yet: that call returns `{ ok: false, reason: 'no_subscription' }`, but the ID is remembered and sent with the next subscribe, so the subscription is never linked to an earlier user.
-- If the identify request fails for a network or server reason, the new ID stays stored and is resent (and verified by the API) on the next `POST /subscribers`. If the API rejects the hash (`identity_hash_invalid`), the stored ID is cleared rather than falling back to the previous user.
+- If the identify request fails for a network or server reason (`network_error`, `timed_out`, `server_<status>`, …), the new ID stays stored but marked unconfirmed. On the next page load (when a valid subscription exists) the SDK re-sends it to `/subscribers/identify` once per page load until the API confirms it; a successful `POST /subscribers` that carried the ID also confirms it. If the API rejects the hash (`identity_hash_invalid`), the stored ID is cleared rather than falling back to the previous user (and `reachbell:identity-dropped` fires when this happens in the background).
+- If `identify()` is called while a subscribe is in flight, the newest call still wins: once the registration succeeds the SDK sends the newer ID (or unlinks, after `identify(null)`), and a rejected hash on the in-flight request never clears an ID set after it was sent.
 - `identify(null)` always forgets the stored ID locally. If the `/subscribers/unidentify` call fails (offline, `server_<status>`), it returns `{ ok: false, reason }` and the server-side link stays until a later `identify(null)` succeeds — retry it if you need the unlink to be guaranteed.
 - `unsubscribe()` also forgets the stored ID.
 
 ### Storage
 
-Token, endpoint, identity and the unsubscribe opt-out are stored in `localStorage`, keyed by API key (`reachbell_token:<apiKey>`, `reachbell_identity:<apiKey>`, `reachbell_opted_out:<apiKey>`, …). When `localStorage` is unavailable (Safari private mode, blocked storage) the token and opt-out are kept in memory, so `unsubscribe()` still sticks for the rest of the page session. Because the keys include the API key, rotating the public key starts with fresh local state (the earlier opt-out and identity are not carried over).
+Token, endpoint, identity and the unsubscribe opt-out are stored in `localStorage`, keyed by API key (`reachbell_token:<apiKey>`, `reachbell_identity:<apiKey>`, `reachbell_opted_out:<apiKey>`, …). When `localStorage` is unavailable (Safari private mode, blocked storage) the token, identity and opt-out are kept in memory, so `identify()` and `unsubscribe()` still stick for the rest of the page session. The in-memory copy is only used while storage writes fail; when `localStorage` works it stays the source of truth (it is shared with other tabs). Because the keys include the API key, rotating the public key starts with fresh local state (the earlier opt-out and identity are not carried over).
 
 ## Service Worker
 

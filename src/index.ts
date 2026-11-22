@@ -285,7 +285,11 @@ const SESSION_SHOWS_KEY = 'reachbell_prompt_session_shows';
 const ENDPOINT_KEY = 'reachbell_endpoint';
 /** Set by unsubscribe(), cleared only by prompt(): stops silent re-subscribe. */
 const OPT_OUT_KEY = 'reachbell_opted_out';
-/** { externalId, hash? } from the latest identify() (newest user wins). */
+/**
+ * { externalId, hash?, pending? } from the latest identify() (newest user
+ * wins). `pending` marks an id the API has not confirmed yet; it is
+ * re-sent once per page load until a request that carried it succeeds.
+ */
 const IDENTITY_KEY = 'reachbell_identity';
 const SW_ACTIVATE_TIMEOUT_MS = 10_000;
 
@@ -367,6 +371,31 @@ export function sameApplicationServerKey(current: ArrayBuffer | null | undefined
 interface StoredIdentity {
   externalId: string;
   hash?: string;
+  /** Not yet confirmed by the API (identify/POST /subscribers that sent it hasn't succeeded). */
+  pending?: true;
+}
+
+/** Same user + hash, ignoring the pending marker. */
+function sameIdentity(a: StoredIdentity | null, b: StoredIdentity | null): boolean {
+  if (!a || !b) return a === b;
+  return a.externalId === b.externalId && (a.hash ?? '') === (b.hash ?? '');
+}
+
+function confirmedIdentity(identity: StoredIdentity): StoredIdentity {
+  return identity.hash ? { externalId: identity.externalId, hash: identity.hash } : { externalId: identity.externalId };
+}
+
+function identifyBody(token: string, identity: StoredIdentity): Record<string, string> {
+  return identity.hash
+    ? { token, externalId: identity.externalId, identityHash: identity.hash }
+    : { token, externalId: identity.externalId };
+}
+
+/** Window event fired when the SDK drops the stored identity because its hash was rejected. */
+export const IDENTITY_DROPPED_EVENT = 'reachbell:identity-dropped';
+
+export interface IdentityDroppedDetail {
+  externalId: string;
 }
 
 class ReachBellClient {
@@ -384,11 +413,17 @@ class ReachBellClient {
   /** Set while a bell widget is mounted so it can reflect subscribe/unsubscribe. */
   private onSubscriptionChange: (() => void) | null = null;
   /**
-   * In-memory mirror of the opt-out flag (keyed like the storage entry) so
-   * unsubscribe() still sticks for this page session when localStorage is
-   * unavailable (Safari private mode, blocked storage).
+   * Fallback for the opt-out flag (keyed like the storage entry), used only
+   * when the last localStorage write for that key threw (Safari private
+   * mode, blocked storage) so unsubscribe() still sticks for this page
+   * session. A successful write removes the entry, so localStorage (which
+   * other tabs share) stays authoritative whenever it works.
    */
-  private optedOutMemory = new Set<string>();
+  private optedOutMemory = new Map<string, boolean>();
+  /** Same fallback for the stored identity. */
+  private identityMemory = new Map<string, StoredIdentity | null>();
+  /** The unconfirmed-identity retry runs at most once per page load (per init). */
+  private identityRetried = false;
 
   init(config: ReachBellConfig): void {
     if (this.config && !config.force) {
@@ -428,6 +463,7 @@ class ReachBellClient {
     this.swReg = null;
     this.prompting = null;
     this.token = null;
+    this.identityRetried = false;
   }
 
   private async bootstrap(): Promise<void> {
@@ -736,7 +772,10 @@ class ReachBellClient {
         || !sameApplicationServerKey(sub.options?.applicationServerKey, this.serverContext.vapidKeys.public)
         || !this.readToken()
         || this.readEndpoint() !== sub.endpoint;
-      if (!stale) return;
+      if (!stale) {
+        await this.retryPendingIdentity(superseded);
+        return;
+      }
       const result = await this.subscribe(superseded);
       if (!result.success) this.log('Subscription sync failed', result.reason);
     } catch (e) {
@@ -832,26 +871,99 @@ class ReachBellClient {
     if (superseded()) return { success: false, reason: 'superseded' };
 
     try {
-      const identity = this.readIdentity();
-      let result = await this.registerSubscriber(sub, identity, superseded);
-      if (!result.success && identity && result.reason === 'identity_hash_invalid' && !superseded()) {
+      const sent = this.readIdentity();
+      let linked: StoredIdentity | null = sent;
+      let result = await this.registerSubscriber(sub, sent, superseded);
+      if (!result.success && sent && result.reason === 'identity_hash_invalid' && !superseded()) {
         // A stale hash (e.g. the shop re-linked and rotated its secret) must
         // not block the push subscription itself — register without it.
-        this.storeIdentity(null);
+        // Only clear the stored id if identify() hasn't replaced it meanwhile.
+        const dropped = sameIdentity(this.readIdentity(), sent);
+        if (dropped) this.storeIdentity(null);
+        linked = null;
         result = await this.registerSubscriber(sub, null, superseded);
-        if (result.success) {
+        if (result.success && dropped) {
           result = { ...result, identityDropped: true };
-          this.log(`Identity hash for "${identity.externalId}" was rejected (identity_hash_invalid) — subscribed without an externalId. Call identify() again with a fresh hash.`);
-          if (this.config?.debug) {
-            // eslint-disable-next-line no-console
-            console.warn('[ReachBell] Stored identity dropped: its identity hash was rejected (identity_hash_invalid).');
-          }
+          this.log(`Identity hash for "${sent.externalId}" was rejected (identity_hash_invalid) — subscribed without an externalId. Call identify() again with a fresh hash.`);
+          this.notifyIdentityDropped(sent);
         }
       }
+      if (result.success && !superseded()) await this.reconcileIdentity(linked, result.token ?? this.readToken(), superseded);
       return result;
     } catch (e: any) {
       return { success: false, reason: e?.name === 'AbortError' ? 'timed_out' : 'network_error' };
     }
+  }
+
+  /**
+   * After a successful POST /subscribers that carried `linked`: confirm it,
+   * or — if identify() changed the stored identity while the request was in
+   * flight — send the newest one so the server row isn't left on the old user.
+   */
+  private async reconcileIdentity(
+    linked: StoredIdentity | null,
+    token: string | null,
+    superseded: () => boolean,
+  ): Promise<void> {
+    const current = this.readIdentity();
+    if (sameIdentity(current, linked)) {
+      if (current?.pending) this.storeIdentity(confirmedIdentity(current));
+      return;
+    }
+    if (!token) return;
+    if (!current) {
+      // identify(null) landed mid-request: undo the link the POST just made.
+      await this.postJson('/subscribers/unidentify', { token });
+      return;
+    }
+    const result = await this.postJson('/subscribers/identify', identifyBody(token, current));
+    if (!superseded()) this.settleIdentity(current, result);
+  }
+
+  /**
+   * Bootstrap/sync with a valid subscription: re-send a stored identity the
+   * API never confirmed (identify() failed offline or with server_*). Once
+   * per page load.
+   */
+  private async retryPendingIdentity(superseded: () => boolean = this.supersededCheck()): Promise<void> {
+    if (this.identityRetried) return;
+    const identity = this.readIdentity();
+    const token = this.readToken();
+    if (!identity?.pending || !token) return;
+    this.identityRetried = true;
+    const result = await this.postJson('/subscribers/identify', identifyBody(token, identity));
+    if (superseded()) return;
+    this.settleIdentity(identity, result);
+  }
+
+  /** Record the outcome of an identify request for `sent`, unless a newer identify() replaced it. */
+  private settleIdentity(sent: StoredIdentity, result: ApiResult): void {
+    if (!sameIdentity(this.readIdentity(), sent)) return;
+    if (result.ok) {
+      this.storeIdentity(confirmedIdentity(sent));
+    } else if (result.reason === 'identity_hash_invalid') {
+      this.storeIdentity(null);
+      this.notifyIdentityDropped(sent);
+    }
+    // Anything else (offline, server_*): stays pending and is retried.
+  }
+
+  /**
+   * Surfaces a dropped identity outside prompt()'s return value (background
+   * re-subscribes, the pending-identity retry): a debug warning plus a
+   * `reachbell:identity-dropped` window event with `{ externalId }`.
+   */
+  private notifyIdentityDropped(identity: StoredIdentity): void {
+    if (this.config?.debug) {
+      // eslint-disable-next-line no-console
+      console.warn(`[ReachBell] Stored identity "${identity.externalId}" dropped: its identity hash was rejected (identity_hash_invalid). Call identify() again with a fresh hash.`);
+    }
+    try {
+      if (typeof window !== 'undefined') {
+        const detail: IdentityDroppedDetail = { externalId: identity.externalId };
+        window.dispatchEvent(new CustomEvent(IDENTITY_DROPPED_EVENT, { detail }));
+      }
+    } catch { /* CustomEvent unsupported — best-effort */ }
   }
 
   private registerSubscriber(
@@ -943,37 +1055,49 @@ class ReachBellClient {
 
   private isOptedOut(): boolean {
     const key = this.scopedKey(OPT_OUT_KEY);
-    if (this.optedOutMemory.has(key)) return true;
+    // Memory only holds a value when the last storage write threw.
+    const remembered = this.optedOutMemory.get(key);
+    if (remembered !== undefined) return remembered;
     try { return localStorage.getItem(key) === '1'; } catch { return false; }
   }
 
   private setOptedOut(optedOut: boolean): void {
     const key = this.scopedKey(OPT_OUT_KEY);
-    if (optedOut) this.optedOutMemory.add(key);
-    else this.optedOutMemory.delete(key);
     try {
-      if (optedOut) localStorage.setItem(this.scopedKey(OPT_OUT_KEY), '1');
-      else localStorage.removeItem(this.scopedKey(OPT_OUT_KEY));
-    } catch { }
+      if (optedOut) localStorage.setItem(key, '1');
+      else localStorage.removeItem(key);
+      this.optedOutMemory.delete(key);
+    } catch {
+      this.optedOutMemory.set(key, optedOut);
+    }
   }
 
   private readIdentity(): StoredIdentity | null {
+    const key = this.scopedKey(IDENTITY_KEY);
+    // Memory only holds a value when the last storage write threw.
+    if (this.identityMemory.has(key)) return this.identityMemory.get(key) ?? null;
     try {
-      const parsed: unknown = JSON.parse(localStorage.getItem(this.scopedKey(IDENTITY_KEY)) ?? 'null');
+      const parsed: unknown = JSON.parse(localStorage.getItem(key) ?? 'null');
       if (!parsed || typeof parsed !== 'object') return null;
-      const { externalId, hash } = parsed as { externalId?: unknown; hash?: unknown };
+      const { externalId, hash, pending } = parsed as { externalId?: unknown; hash?: unknown; pending?: unknown };
       if (typeof externalId !== 'string' || !externalId) return null;
-      return typeof hash === 'string' && hash ? { externalId, hash } : { externalId };
+      const identity: StoredIdentity = typeof hash === 'string' && hash ? { externalId, hash } : { externalId };
+      if (pending === true) identity.pending = true;
+      return identity;
     } catch {
       return null;
     }
   }
 
   private storeIdentity(identity: StoredIdentity | null): void {
+    const key = this.scopedKey(IDENTITY_KEY);
     try {
-      if (identity) localStorage.setItem(this.scopedKey(IDENTITY_KEY), JSON.stringify(identity));
-      else localStorage.removeItem(this.scopedKey(IDENTITY_KEY));
-    } catch { }
+      if (identity) localStorage.setItem(key, JSON.stringify(identity));
+      else localStorage.removeItem(key);
+      this.identityMemory.delete(key);
+    } catch {
+      this.identityMemory.set(key, identity ? { ...identity } : null);
+    }
   }
 
   /** True when this browser holds an active ReachBell subscription for the project. */
@@ -998,8 +1122,10 @@ class ReachBellClient {
    * identity, including when there is no subscription yet — that call
    * returns `{ ok:false, reason:'no_subscription' }` but the id is
    * remembered and sent with the next subscribe. A network/server failure
-   * keeps the new id stored (it is resent, and verified, on the next
-   * POST /subscribers); `identity_hash_invalid` clears the stored identity.
+   * keeps the new id stored as unconfirmed: it is re-sent to
+   * /subscribers/identify once on the next page load (or with the next
+   * POST /subscribers) until the API confirms it. `identity_hash_invalid`
+   * clears the stored identity (unless a newer identify() replaced it).
    *
    * `identify(null)` always forgets the stored id locally; if the
    * /subscribers/unidentify call fails it returns `{ ok:false, reason }`
@@ -1019,15 +1145,14 @@ class ReachBellClient {
     }
     const hash = typeof opts?.hash === 'string' && opts.hash ? opts.hash : undefined;
     const identity: StoredIdentity = hash ? { externalId, hash } : { externalId };
-    if (!token) {
-      // Remember it so the next subscribe sends this user, never an older one.
-      this.storeIdentity(identity);
-      return { ok: false, reason: 'no_subscription' };
-    }
-    const result = await this.postJson('/subscribers/identify', hash ? { token, externalId, identityHash: hash } : { token, externalId });
-    // Never keep the previous user's id: a rejected hash clears it, any other
-    // outcome stores this one (resent and verified on the next POST /subscribers).
-    this.storeIdentity(!result.ok && result.reason === 'identity_hash_invalid' ? null : identity);
+    // Store it (unconfirmed) before any request so a subscribe in flight —
+    // and every later one — sends this user, never an older one.
+    this.storeIdentity({ ...identity, pending: true });
+    if (!token) return { ok: false, reason: 'no_subscription' };
+    const result = await this.postJson('/subscribers/identify', identifyBody(token, identity));
+    // Success confirms it, a rejected hash clears it, anything else leaves it
+    // pending for the retry — unless a newer identify() already replaced it.
+    this.settleIdentity(identity, result);
     return result;
   }
 
