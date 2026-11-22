@@ -465,3 +465,38 @@ describe('nativePromptNeedsGesture', () => {
     expect(nativePromptNeedsGesture('')).toBe(true);
   });
 });
+
+describe('subscription lifecycle', () => {
+  beforeEach(() => {
+    (ReachBell as any).config = { apiKey: 'k', apiUrl: 'https://x.test' };
+    (ReachBell as any).swReg = null;
+    (ReachBell as any).bootstrapping = null;
+  });
+
+  it('unsubscribe() waits for bootstrap before looking up the subscription', async () => {
+    const unsub = vi.fn().mockResolvedValue(true);
+    let finish!: () => void;
+    (ReachBell as any).bootstrapping = new Promise<void>(resolve => {
+      finish = () => {
+        (ReachBell as any).swReg = { pushManager: { getSubscription: async () => ({ unsubscribe: unsub }) } };
+        resolve();
+      };
+    });
+    const result = ReachBell.unsubscribe();
+    finish();
+    await expect(result).resolves.toEqual({ ok: true });
+    expect(unsub).toHaveBeenCalledOnce();
+  });
+
+  it('a superseded context load does not overwrite the new project settings', async () => {
+    let respond!: (r: Response) => void;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockReturnValue(new Promise<Response>(r => { respond = r; }));
+    (ReachBell as any).serverContext = null;
+    const load = (ReachBell as any).loadContext();
+    (ReachBell as any).config = { apiKey: 'other', apiUrl: 'https://x.test' };
+    respond(new Response(JSON.stringify({ promptConfig: { enabled: true } }), { status: 200 }));
+    await load;
+    expect((ReachBell as any).serverContext).toBeNull();
+    fetchSpy.mockRestore();
+  });
+});

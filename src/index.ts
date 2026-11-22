@@ -395,12 +395,17 @@ class ReachBellClient {
 
   private async bootstrap(): Promise<void> {
     if (typeof window === 'undefined') return;
+    // A force re-init swaps this.config; an older bootstrap still in flight
+    // must stop instead of mounting widgets or prompts for the old project.
+    const config = this.config;
+    const superseded = () => this.config !== config;
     try {
       await this.loadContext();
     } catch (e) {
-      this.warnOnce('Could not load ReachBell settings — push notifications will not work on this page', e);
+      if (!superseded()) this.warnOnce('Could not load ReachBell settings — push notifications will not work on this page', e);
       return;
     }
+    if (superseded()) return;
 
     try {
       this.mountLayouts(this.serverContext?.customLayouts ?? {});
@@ -413,6 +418,7 @@ class ReachBellClient {
     } catch (e) {
       this.warnOnce('Service worker registration failed — push notifications will not work on this page', e);
     }
+    if (superseded()) return;
 
     try {
       this.armPromptUi();
@@ -424,7 +430,9 @@ class ReachBellClient {
   }
 
   private async loadContext(): Promise<void> {
+    const config = this.config;
     const ctx = await this.fetchContext();
+    if (this.config !== config) return;
     this.serverContext = ctx;
     this.promptConfig = ctx?.promptConfig ?? null;
   }
@@ -606,7 +614,9 @@ class ReachBellClient {
       this.log('Service workers not supported');
       return;
     }
-    const reg = await navigator.serviceWorker.register(this.config!.swPath!);
+    const config = this.config;
+    const reg = await navigator.serviceWorker.register(config!.swPath!);
+    if (this.config !== config) return;
     this.swReg = reg;
     this.log('SW registered', reg);
     this.sendWorkerConfig(reg.active ?? reg.waiting ?? reg.installing);
@@ -771,6 +781,12 @@ class ReachBellClient {
 
   async unsubscribe(): Promise<ApiResult> {
     if (!this.config) return { ok: false, reason: 'sdk_not_initialized' };
+    // swReg is only set once bootstrap has registered the worker; without
+    // this wait an early call would report ok:true and leave the push
+    // subscription in place.
+    if (this.bootstrapping) {
+      try { await this.bootstrapping; } catch { }
+    }
     try {
       const reg = this.swReg ?? null;
       const sub = reg ? await reg.pushManager.getSubscription() : null;
