@@ -531,6 +531,7 @@ function fakeRegistration(existing: boolean) {
 describe('unsubscribe opt-out', () => {
   beforeEach(() => {
     localStorage.clear();
+    (ReachBell as any).optedOutMemory.clear();
     (ReachBell as any).config = { apiKey: 'k', apiUrl: 'https://x.test', swPath: '/reachbell-sw.js' };
     (ReachBell as any).bootstrapping = null;
     (ReachBell as any).prompting = null;
@@ -583,6 +584,49 @@ describe('unsubscribe opt-out', () => {
   it('reports failure instead of ok:true when no registration exists', async () => {
     vi.stubGlobal('navigator', { ...navigator, serviceWorker: { getRegistration: vi.fn().mockResolvedValue(undefined) } });
     await expect(ReachBell.unsubscribe()).resolves.toEqual({ ok: false, reason: 'sw_not_registered' });
+  });
+
+  it('still tells a mounted bell widget when no registration exists', async () => {
+    vi.stubGlobal('navigator', { ...navigator, serviceWorker: { getRegistration: vi.fn().mockResolvedValue(undefined) } });
+    const onChange = vi.fn();
+    (ReachBell as any).onSubscriptionChange = onChange;
+    try {
+      await expect(ReachBell.unsubscribe()).resolves.toEqual({ ok: false, reason: 'sw_not_registered' });
+      expect(onChange).toHaveBeenCalled();
+      expect((ReachBell as any).isSubscribed()).toBe(false);
+    } finally {
+      (ReachBell as any).onSubscriptionChange = null;
+    }
+  });
+
+  it('keeps the opt-out for the page session when localStorage is unavailable', async () => {
+    const { reg, sub, pushManager } = fakeRegistration(true);
+    (ReachBell as any).swReg = reg;
+    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => { throw new DOMException('denied', 'SecurityError'); });
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new DOMException('denied', 'SecurityError'); });
+    vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(() => { throw new DOMException('denied', 'SecurityError'); });
+    (ReachBell as any).token = 't1';
+    await expect(ReachBell.unsubscribe()).resolves.toEqual({ ok: true });
+    expect(sub.unsubscribe).toHaveBeenCalledOnce();
+    expect((ReachBell as any).isOptedOut()).toBe(true);
+
+    pushManager.getSubscription.mockResolvedValue(null);
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    await (ReachBell as any).syncSubscription();
+    expect(pushManager.subscribe).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // prompt() is still the way back in.
+    (ReachBell as any).setOptedOut(false);
+    expect((ReachBell as any).isOptedOut()).toBe(false);
+  });
+
+  it('unsubscribe() clears the stored identity', async () => {
+    const { reg } = fakeRegistration(true);
+    (ReachBell as any).swReg = reg;
+    (ReachBell as any).storeIdentity({ externalId: 'u1', hash: 'h1' });
+    await ReachBell.unsubscribe();
+    expect((ReachBell as any).readIdentity()).toBeNull();
   });
 });
 
@@ -674,9 +718,108 @@ describe('identify', () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch')
       .mockResolvedValueOnce(jsonResponse({ success: false, reason: 'identity_hash_invalid' }, 201))
       .mockResolvedValueOnce(jsonResponse({ token: 't9' }));
-    await expect((ReachBell as any).subscribe()).resolves.toEqual({ success: true, token: 't9' });
+    await expect((ReachBell as any).subscribe()).resolves.toEqual({ success: true, token: 't9', identityDropped: true });
     expect(bodyOf(fetchSpy, 1).externalId).toBeUndefined();
     expect((ReachBell as any).readIdentity()).toBeNull();
     (ReachBell as any).swReg = null;
+  });
+});
+
+describe('force re-init while subscribing', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    (ReachBell as any).config = { apiKey: 'old', apiUrl: 'https://x.test' };
+    (ReachBell as any).token = null;
+    (ReachBell as any).serverContext = { vapidKeys: { public: VAPID } };
+    vi.stubGlobal('Notification', { permission: 'granted', requestPermission: vi.fn() });
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    (ReachBell as any).swReg = null;
+  });
+
+  it('does not register or store a token when re-initialised during pushManager.subscribe', async () => {
+    const { reg, sub, pushManager } = fakeRegistration(false);
+    (ReachBell as any).swReg = reg;
+    let finish!: () => void;
+    pushManager.subscribe.mockReturnValue(new Promise(resolve => { finish = () => resolve(sub); }));
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ token: 't-old' }));
+    const sync = (ReachBell as any).syncSubscription();
+    await vi.waitFor(() => expect(pushManager.subscribe).toHaveBeenCalled());
+    (ReachBell as any).config = { apiKey: 'new', apiUrl: 'https://x.test' };
+    finish();
+    await sync;
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(localStorage.getItem('reachbell_token:new')).toBeNull();
+    expect(localStorage.getItem('reachbell_token:old')).toBeNull();
+  });
+
+  it('does not store the token when re-initialised while POST /subscribers is in flight', async () => {
+    const { reg } = fakeRegistration(true);
+    (ReachBell as any).swReg = reg;
+    let respond!: (r: Response) => void;
+    vi.spyOn(globalThis, 'fetch').mockReturnValue(new Promise<Response>(r => { respond = r; }));
+    const result = (ReachBell as any).subscribe();
+    await vi.waitFor(() => expect(respond).toBeTypeOf('function'));
+    (ReachBell as any).config = { apiKey: 'new', apiUrl: 'https://x.test' };
+    respond(jsonResponse({ token: 't-old' }));
+    await expect(result).resolves.toEqual({ success: false, reason: 'superseded' });
+    expect((ReachBell as any).token).toBeNull();
+    expect(localStorage.getItem('reachbell_token:new')).toBeNull();
+  });
+});
+
+describe('identify — newest user wins', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    (ReachBell as any).config = { apiKey: 'k', apiUrl: 'https://x.test' };
+    (ReachBell as any).token = null;
+    (ReachBell as any).serverContext = { vapidKeys: { public: VAPID } };
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    (ReachBell as any).swReg = null;
+  });
+
+  const bodyOf = (spy: { mock: { calls: unknown[][] } }, call = 0) =>
+    JSON.parse((spy.mock.calls[call][1] as RequestInit).body as string);
+
+  it('remembers an identify() made before subscribing and sends it on subscribe, replacing an older user', async () => {
+    (ReachBell as any).storeIdentity({ externalId: 'old_user', hash: 'old_hash' });
+    await expect(ReachBell.identify('new_user', { hash: 'new_hash' })).resolves.toEqual({ ok: false, reason: 'no_subscription' });
+    expect((ReachBell as any).readIdentity()).toEqual({ externalId: 'new_user', hash: 'new_hash' });
+
+    const { reg } = fakeRegistration(true);
+    (ReachBell as any).swReg = reg;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ token: 't1' }));
+    await expect((ReachBell as any).subscribe()).resolves.toEqual({ success: true, token: 't1' });
+    expect(bodyOf(fetchSpy)).toMatchObject({ externalId: 'new_user', identityHash: 'new_hash' });
+  });
+
+  it('a rejected hash clears the previous user instead of keeping it', async () => {
+    (ReachBell as any).storeToken('t1', null);
+    (ReachBell as any).storeIdentity({ externalId: 'old_user' });
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ success: false, reason: 'identity_hash_invalid' }, 201));
+    await expect(ReachBell.identify('shopify_customer_9', { hash: 'bad' })).resolves.toEqual({ ok: false, reason: 'identity_hash_invalid' });
+    expect((ReachBell as any).readIdentity()).toBeNull();
+  });
+
+  it('a network failure still stores the new user so it is resent on the next subscribe', async () => {
+    (ReachBell as any).storeToken('t1', null);
+    (ReachBell as any).storeIdentity({ externalId: 'old_user' });
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new TypeError('Failed to fetch'));
+    await expect(ReachBell.identify('new_user')).resolves.toEqual({ ok: false, reason: 'network_error' });
+    expect((ReachBell as any).readIdentity()).toEqual({ externalId: 'new_user' });
+  });
+
+  it('flags a successful subscribe that had to drop a stale identity hash', async () => {
+    const { reg } = fakeRegistration(true);
+    (ReachBell as any).swReg = reg;
+    (ReachBell as any).storeIdentity({ externalId: 'shopify_customer_7', hash: 'old' });
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(jsonResponse({ success: false, reason: 'identity_hash_invalid' }, 201))
+      .mockResolvedValueOnce(jsonResponse({ token: 't9' }));
+    await expect((ReachBell as any).subscribe()).resolves.toEqual({ success: true, token: 't9', identityDropped: true });
   });
 });

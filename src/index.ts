@@ -45,6 +45,13 @@ export interface SubscribeResult {
   success: boolean;
   token?:  string;
   reason?: string;
+  /**
+   * Set on a successful subscribe when the stored externalId was dropped
+   * because the API rejected its identity hash (`identity_hash_invalid`,
+   * e.g. after the identity secret rotated). The subscription is active but
+   * anonymous — call identify() again with a fresh hash to link the user.
+   */
+  identityDropped?: true;
 }
 
 export interface ApiResult {
@@ -278,7 +285,7 @@ const SESSION_SHOWS_KEY = 'reachbell_prompt_session_shows';
 const ENDPOINT_KEY = 'reachbell_endpoint';
 /** Set by unsubscribe(), cleared only by prompt(): stops silent re-subscribe. */
 const OPT_OUT_KEY = 'reachbell_opted_out';
-/** { externalId, hash? } from the last successful identify(). */
+/** { externalId, hash? } from the latest identify() (newest user wins). */
 const IDENTITY_KEY = 'reachbell_identity';
 const SW_ACTIVATE_TIMEOUT_MS = 10_000;
 
@@ -376,6 +383,12 @@ class ReachBellClient {
   private token: string | null = null;
   /** Set while a bell widget is mounted so it can reflect subscribe/unsubscribe. */
   private onSubscriptionChange: (() => void) | null = null;
+  /**
+   * In-memory mirror of the opt-out flag (keyed like the storage entry) so
+   * unsubscribe() still sticks for this page session when localStorage is
+   * unavailable (Safari private mode, blocked storage).
+   */
+  private optedOutMemory = new Set<string>();
 
   init(config: ReachBellConfig): void {
     if (this.config && !config.force) {
@@ -708,7 +721,7 @@ class ReachBellClient {
     return reg.active ? reg : null;
   }
 
-  private async syncSubscription(superseded: () => boolean = () => false): Promise<void> {
+  private async syncSubscription(superseded: () => boolean = this.supersededCheck()): Promise<void> {
     if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
     if (!this.swReg || !this.serverContext?.vapidKeys?.public) return;
     // The visitor unsubscribed: permission stays granted, but we must not
@@ -724,7 +737,7 @@ class ReachBellClient {
         || !this.readToken()
         || this.readEndpoint() !== sub.endpoint;
       if (!stale) return;
-      const result = await this.subscribe();
+      const result = await this.subscribe(superseded);
       if (!result.success) this.log('Subscription sync failed', result.reason);
     } catch (e) {
       this.log('Subscription sync failed', e);
@@ -786,10 +799,17 @@ class ReachBellClient {
     return this.subscribe();
   }
 
-  private async subscribe(): Promise<SubscribeResult> {
+  /** A check that turns true once a (force) re-init replaces the current config. */
+  private supersededCheck(): () => boolean {
+    const config = this.config;
+    return () => this.config !== config;
+  }
+
+  private async subscribe(superseded: () => boolean = this.supersededCheck()): Promise<SubscribeResult> {
     const publicKey: string | undefined = this.serverContext?.vapidKeys?.public;
     if (!this.swReg || !publicKey) return { success: false, reason: 'not_ready' };
     const reg = await this.activeRegistration();
+    if (superseded()) return { success: false, reason: 'superseded' };
     if (!reg) return { success: false, reason: 'sw_not_active' };
 
     let sub: PushSubscription;
@@ -806,15 +826,27 @@ class ReachBellClient {
     } catch (e: any) {
       return { success: false, reason: `push_subscribe_failed_${e?.name ?? 'unknown'}` };
     }
+    // A force re-init (other project/API key) landed while the browser was
+    // subscribing: don't register this subscription or store its token
+    // under the new project.
+    if (superseded()) return { success: false, reason: 'superseded' };
 
     try {
       const identity = this.readIdentity();
-      let result = await this.registerSubscriber(sub, identity);
-      if (!result.success && identity && result.reason === 'identity_hash_invalid') {
+      let result = await this.registerSubscriber(sub, identity, superseded);
+      if (!result.success && identity && result.reason === 'identity_hash_invalid' && !superseded()) {
         // A stale hash (e.g. the shop re-linked and rotated its secret) must
         // not block the push subscription itself — register without it.
         this.storeIdentity(null);
-        result = await this.registerSubscriber(sub, null);
+        result = await this.registerSubscriber(sub, null, superseded);
+        if (result.success) {
+          result = { ...result, identityDropped: true };
+          this.log(`Identity hash for "${identity.externalId}" was rejected (identity_hash_invalid) — subscribed without an externalId. Call identify() again with a fresh hash.`);
+          if (this.config?.debug) {
+            // eslint-disable-next-line no-console
+            console.warn('[ReachBell] Stored identity dropped: its identity hash was rejected (identity_hash_invalid).');
+          }
+        }
       }
       return result;
     } catch (e: any) {
@@ -822,7 +854,11 @@ class ReachBellClient {
     }
   }
 
-  private registerSubscriber(sub: PushSubscription, identity: StoredIdentity | null): Promise<SubscribeResult> {
+  private registerSubscriber(
+    sub: PushSubscription,
+    identity: StoredIdentity | null,
+    superseded: () => boolean = this.supersededCheck(),
+  ): Promise<SubscribeResult> {
     const body: Record<string, unknown> = {
       subscription: sub.toJSON(),
       token:        JSON.stringify(sub),
@@ -840,6 +876,8 @@ class ReachBellClient {
       if (!res.ok) return { success: false, reason: `subscribe_failed_${res.status}` };
       const data = await res.json();
       if (data?.success === false) return { success: false, reason: data.reason ?? 'subscribe_rejected' };
+      // Re-initialised for another project while the request was in flight.
+      if (superseded()) return { success: false, reason: 'superseded' };
       const t: string | null = data?.token ?? null;
       this.storeToken(t, sub.endpoint);
       return { success: true, token: t ?? undefined };
@@ -855,8 +893,11 @@ class ReachBellClient {
       try { await this.bootstrapping; } catch { }
     }
     // Record the opt-out first: even if the browser subscription can't be
-    // removed below, the next page load must not subscribe again.
+    // removed below, the next page load must not subscribe again. The
+    // stored identity goes too, so a later subscribe is anonymous until the
+    // app calls identify() again.
     this.setOptedOut(true);
+    this.storeIdentity(null);
     try {
       let reg = this.swReg ?? null;
       if (!reg && typeof navigator !== 'undefined' && navigator.serviceWorker?.getRegistration) {
@@ -864,12 +905,18 @@ class ReachBellClient {
         // the worker from an earlier visit may still hold the subscription.
         reg = (await navigator.serviceWorker.getRegistration(this.config.swPath || DEFAULT_SW_PATH)) ?? null;
       }
-      if (!reg) return { ok: false, reason: 'sw_not_registered' };
+      if (!reg) {
+        // The opt-out above still changed the subscribed state — let a
+        // mounted bell widget reflect it.
+        this.onSubscriptionChange?.();
+        return { ok: false, reason: 'sw_not_registered' };
+      }
       const sub = await reg.pushManager.getSubscription();
       if (sub) await sub.unsubscribe();
       this.storeToken(null, null);
       return { ok: true };
     } catch (e: any) {
+      this.onSubscriptionChange?.();
       return { ok: false, reason: `unsubscribe_failed_${e?.name ?? 'unknown'}` };
     }
   }
@@ -895,10 +942,15 @@ class ReachBellClient {
   }
 
   private isOptedOut(): boolean {
-    try { return localStorage.getItem(this.scopedKey(OPT_OUT_KEY)) === '1'; } catch { return false; }
+    const key = this.scopedKey(OPT_OUT_KEY);
+    if (this.optedOutMemory.has(key)) return true;
+    try { return localStorage.getItem(key) === '1'; } catch { return false; }
   }
 
   private setOptedOut(optedOut: boolean): void {
+    const key = this.scopedKey(OPT_OUT_KEY);
+    if (optedOut) this.optedOutMemory.add(key);
+    else this.optedOutMemory.delete(key);
     try {
       if (optedOut) localStorage.setItem(this.scopedKey(OPT_OUT_KEY), '1');
       else localStorage.removeItem(this.scopedKey(OPT_OUT_KEY));
@@ -941,6 +993,17 @@ class ReachBellClient {
    * unlink it. `opts.hash` is the identity-verification HMAC required for
    * verified ids (e.g. `shopify_customer_…`); it is stored with the id and
    * resent whenever the SDK sends that id again.
+   *
+   * The newest call wins: the id (and hash) replaces any previously stored
+   * identity, including when there is no subscription yet — that call
+   * returns `{ ok:false, reason:'no_subscription' }` but the id is
+   * remembered and sent with the next subscribe. A network/server failure
+   * keeps the new id stored (it is resent, and verified, on the next
+   * POST /subscribers); `identity_hash_invalid` clears the stored identity.
+   *
+   * `identify(null)` always forgets the stored id locally; if the
+   * /subscribers/unidentify call fails it returns `{ ok:false, reason }`
+   * and the server-side link stays until identify(null) succeeds.
    */
   async identify(externalId: string | null, opts: IdentifyOptions = {}): Promise<ApiResult> {
     if (!this.config) return { ok: false, reason: 'sdk_not_initialized' };
@@ -954,10 +1017,17 @@ class ReachBellClient {
       if (!token) return { ok: false, reason: 'no_subscription' };
       return this.postJson('/subscribers/unidentify', { token });
     }
-    if (!token) return { ok: false, reason: 'no_subscription' };
     const hash = typeof opts?.hash === 'string' && opts.hash ? opts.hash : undefined;
+    const identity: StoredIdentity = hash ? { externalId, hash } : { externalId };
+    if (!token) {
+      // Remember it so the next subscribe sends this user, never an older one.
+      this.storeIdentity(identity);
+      return { ok: false, reason: 'no_subscription' };
+    }
     const result = await this.postJson('/subscribers/identify', hash ? { token, externalId, identityHash: hash } : { token, externalId });
-    if (result.ok) this.storeIdentity(hash ? { externalId, hash } : { externalId });
+    // Never keep the previous user's id: a rejected hash clears it, any other
+    // outcome stores this one (resent and verified on the next POST /subscribers).
+    this.storeIdentity(!result.ok && result.reason === 'identity_hash_invalid' ? null : identity);
     return result;
   }
 
